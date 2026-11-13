@@ -248,6 +248,46 @@ describe('AdapterManager filesystem lifetime', () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
+  it('keeps a materialised cache write inside the shadow vault when the path resolves outside it', async () => {
+    const h = harness();
+    await h.mgr.patch();
+    const outsideName = `escaped-${path.basename(h.root)}.txt`;
+    const victim = path.resolve(h.root, '..', outsideName);
+    cleanup.push(() => fs.rmSync(victim, { force: true }));
+    const absoluteVictim = path.join(os.tmpdir(), `abs-${outsideName}`);
+    cleanup.push(() => fs.rmSync(absoluteVictim, { force: true }));
+
+    await h.mgr.dataAdapter!.read(`../${outsideName}`);
+    await h.mgr.dataAdapter!.read(`notes/../../${outsideName}`);
+    await h.mgr.dataAdapter!.read(absoluteVictim);
+
+    expect(fs.existsSync(victim), 'a .. path was materialised outside the shadow vault').toBe(false);
+    expect(fs.existsSync(absoluteVictim), 'an absolute path was materialised outside the shadow vault').toBe(false);
+    await h.mgr.dataAdapter!.read('notes/nested.md');
+    expect(fs.readFileSync(path.join(h.root, 'notes', 'nested.md'), 'utf8')).toBe('warm');
+    // `..` that never leaves the vault is still this vault.
+    await h.mgr.dataAdapter!.read('notes/../inside.md');
+    expect(fs.readFileSync(path.join(h.root, 'inside.md'), 'utf8')).toBe('warm');
+  });
+
+  it('does not follow a symlink out of the shadow vault when materialising', async () => {
+    const h = harness();
+    await h.mgr.patch();
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'outside-cache-'));
+    cleanup.push(() => fs.rmSync(outside, { recursive: true, force: true }));
+    const outsideFile = path.join(outside, 'target.txt');
+    fs.writeFileSync(outsideFile, 'keep');
+    fs.symlinkSync(outsideFile, path.join(h.root, 'escape-link.md'));
+    fs.symlinkSync(outside, path.join(h.root, 'linked'));
+
+    await h.mgr.dataAdapter!.read('escape-link.md');
+    await h.mgr.dataAdapter!.read('linked/pwned.md');
+
+    expect(fs.readFileSync(outsideFile, 'utf8'), 'writeFile followed a symlink out of the vault').toBe('keep');
+    expect(fs.lstatSync(path.join(h.root, 'escape-link.md')).isSymbolicLink()).toBe(true);
+    expect(fs.existsSync(path.join(outside, 'pwned.md')), 'mkdir followed a symlinked parent out of the vault').toBe(false);
+  });
+
   it('owns virtual visibility and physical materialisation across two lifetimes', async () => {
     const h = harness();
     const syncRead = h.surface.readFileSync;

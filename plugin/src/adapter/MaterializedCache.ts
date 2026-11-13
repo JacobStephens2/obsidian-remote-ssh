@@ -9,8 +9,12 @@ export interface MaterializedStat {
 
 /** Filesystem surface, injected so the budget/LRU logic tests without a disk. */
 export interface MaterializedCacheDeps {
-  /** Absolute path on the shadow disk for a vault-relative path. */
-  absOf(rel: string): string;
+  /**
+   * Absolute path on the shadow disk for a vault-relative path, or
+   * null when that path is not inside the shadow vault. A null refuses
+   * the materialisation; the cache must not invent a location.
+   */
+  absOf(rel: string): string | null;
   /** Create parents and write. Returns the resulting stat, or null on failure. */
   writeFile(abs: string, data: Buffer): MaterializedStat | null;
   /** Current stat of a local path; null when absent or not a regular file. */
@@ -81,8 +85,9 @@ export class MaterializedCache {
 
   /**
    * Write `data` to the shadow disk and record it. Returns false when
-   * the cache is disabled, the file is over a limit, or the write
-   * fails — callers treat that as "not materialised" and carry on.
+   * the cache is disabled, the file is over a limit, the path leaves
+   * the shadow vault, or the write fails — callers treat that as
+   * "not materialised" and carry on.
    */
   put(rel: string, data: Buffer): boolean {
     if (this.disabled()) return false;
@@ -94,6 +99,10 @@ export class MaterializedCache {
       return false;
     }
     const abs = this.deps.absOf(rel);
+    if (!abs) {
+      logger.warn(`MaterializedCache: refusing to materialise "${rel}" outside the shadow vault`);
+      return false;
+    }
     let stat: MaterializedStat | null;
     try {
       stat = this.deps.writeFile(abs, data);
@@ -113,7 +122,12 @@ export class MaterializedCache {
   has(rel: string): boolean {
     const known = this.entries.get(rel);
     if (!known) return false;
-    const now = this.deps.statFile(this.deps.absOf(rel));
+    const abs = this.deps.absOf(rel);
+    if (!abs) {
+      this.forget(rel);
+      return false;
+    }
+    const now = this.deps.statFile(abs);
     if (!now) {
       this.forget(rel);
       return false;
@@ -178,6 +192,13 @@ export class MaterializedCache {
     const known = this.entries.get(rel);
     if (!known) return;
     const abs = this.deps.absOf(rel);
+    if (!abs) {
+      // The path no longer resolves inside the vault (it never should
+      // have been recorded). Drop the ledger entry and leave the disk
+      // alone — deleting here could follow the path that escaped.
+      this.forget(rel);
+      return;
+    }
     const now = this.deps.statFile(abs);
     if (now && (now.size !== known.size || now.mtimeMs !== known.mtimeMs)) {
       logger.info(

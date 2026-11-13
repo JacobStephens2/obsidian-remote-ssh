@@ -7,6 +7,7 @@ import { ReadCache } from '../cache/ReadCache';
 import { DirCache } from '../cache/DirCache';
 import { SftpDataAdapter } from './SftpDataAdapter';
 import { MaterializedCache } from './MaterializedCache';
+import { containedShadowFile } from './shadowContainment';
 import { LocalWriteWatcher, makeLocalWriteIgnore } from './LocalWriteWatcher';
 import { FsModulePatcher } from './FsModulePatcher';
 import { capturePhysicalFs, type PhysicalFs } from './PhysicalFs';
@@ -291,7 +292,7 @@ export class AdapterManager {
     // the read-through in read/readBinary. Zero budget switches the
     // whole thing off; nothing is ever pre-fetched either way.
     if (eligible) this.materializedCache = new MaterializedCache({
-      absOf: (rel) => path.join(shadowBasePath, rel),
+      absOf: (rel) => containedShadowFile(shadowBasePath, rel, physical),
       writeFile: (abs, data) => {
         physical.mkdirSync(path.dirname(abs), { recursive: true });
         physical.writeFileSync(abs, data);
