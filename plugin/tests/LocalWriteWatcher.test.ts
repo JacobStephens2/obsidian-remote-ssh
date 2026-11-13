@@ -47,6 +47,8 @@ function harness(files: Record<string, string> = {}, maxBytes = 1024 * 1024) {
   return {
     w, push, removeRemote, onError, mirrored,
     trigger: (rel: string | null) => onChange?.(rel),
+    captureEvent: () => onChange!,
+    captureTimer: () => pending!,
     /** Fire the pending debounce and let the async flush settle. */
     tick: async () => {
       const p = pending;
@@ -67,6 +69,69 @@ function harness(files: Record<string, string> = {}, maxBytes = 1024 * 1024) {
 }
 
 describe('LocalWriteWatcher', () => {
+  it('rejects a superseded event and timer after restarting', async () => {
+    const h = harness({ 'old.md': 'old' });
+    h.w.start();
+    const event = h.captureEvent();
+    h.trigger('old.md');
+    const timer = h.captureTimer();
+    h.w.stop();
+    h.w.start();
+    event('old.md');
+    timer();
+    await h.tick();
+    expect(h.hasTimer()).toBe(false);
+    expect(h.push).not.toHaveBeenCalled();
+    h.trigger('new.md');
+    h.write('new.md', 'new');
+    await h.tick(); await h.tick();
+    expect(h.push.mock.calls.map(c => c[0])).toEqual(['new.md']);
+  });
+
+  it.each(['resolve', 'reject'])('ignores a deferred delete %s after stop', async outcome => {
+    const h = harness({ 'a.md': 'a', 'b.md': 'b' });
+    h.w.start();
+    h.trigger('a.md'); h.trigger('b.md');
+    await h.tick(); await h.tick();
+    expect(h.w.pushedCount()).toBe(2);
+    let finish!: () => void;
+    h.removeRemote.mockImplementationOnce(() => new Promise<void>((resolve, reject) => {
+      finish = outcome === 'resolve' ? resolve : () => reject(new Error('late failure'));
+    }));
+    h.unlink('a.md'); h.unlink('b.md');
+    h.trigger('a.md'); h.trigger('b.md');
+    await h.tick();
+    expect(h.removeRemote).toHaveBeenCalledTimes(1);
+    h.w.stop();
+    finish();
+    await h.tick();
+    expect(h.w.pushedCount()).toBe(2);
+    expect(h.removeRemote).toHaveBeenCalledTimes(1);
+    expect(h.onError).not.toHaveBeenCalled();
+    expect(h.hasTimer()).toBe(false);
+  });
+
+  it('ignores stale events and a deferred push completion after stop', async () => {
+    const h = harness({ 'a.md': 'a', 'b.md': 'b' });
+    let finish!: () => void;
+    h.push.mockImplementationOnce(() => new Promise<void>(resolve => { finish = resolve; }));
+    h.w.start();
+    h.trigger('a.md');
+    h.trigger('b.md');
+    await h.tick();
+    await h.tick();
+    expect(h.push).toHaveBeenCalledTimes(1);
+    h.w.stop();
+    h.trigger('late.md');
+    expect(h.hasTimer()).toBe(false);
+    finish();
+    await h.tick();
+    expect(h.push).toHaveBeenCalledTimes(1);
+    expect(h.w.pushedCount()).toBe(0);
+    expect(h.hasTimer()).toBe(false);
+    expect(h.onError).not.toHaveBeenCalled();
+  });
+
   it('pushes a file a plugin wrote under the vault root (#429)', async () => {
     const h = harness();
     h.w.start();

@@ -21,7 +21,7 @@ function isThumbnailEligible(vaultPath: string): boolean {
   if (dot < 0) return false;
   return THUMBNAIL_EXTENSIONS.has(vaultPath.slice(dot + 1).toLowerCase());
 }
-import * as fs from 'fs';
+import { capturePhysicalFs, type PhysicalFs } from './PhysicalFs';
 import * as nodePath from 'path';
 import { pathToFileURL } from 'url';
 import type { MaterializedCache } from './MaterializedCache';
@@ -126,11 +126,11 @@ export class SftpDataAdapter {
      * receive the shadow-vault root (so they don't crash on
      * `undefined`). But the vault tree is virtual — served from the
      * remote, not mirrored to disk — so raw Node `fs` here only touches
-     * the local shadow copy: reads miss remote notes, writes don't
-     * reach the remote. Only the vault API round-trips (#429).
+     * the local shadow copy. AdapterManager owns the optional Node fs
+     * read patch and local write-back watcher for eligible shadow windows.
      *
      * Defaults to `''` for tests that never exercise these members. The
-     * production wiring in `main.ts` always passes the real shadow
+     * production wiring in `AdapterManager` passes the real shadow
      * vault root via `(adapter as FileSystemAdapter).getBasePath()`
      * captured before the patch is applied.
      *
@@ -145,6 +145,7 @@ export class SftpDataAdapter {
      * (#127). When omitted (e.g. unit tests), no UI signaling occurs.
      */
     private transferTracker: TransferTracker | null = null,
+    private readonly physical: PhysicalFs = capturePhysicalFs(),
   ) {}
 
   /**
@@ -212,7 +213,7 @@ export class SftpDataAdapter {
    * The stock implementation just joins onto the base, which over a
    * virtual note tree means handing a plugin a path to nothing (#429).
    * Asking for a full path IS the request that materialises the file:
-   * we fetch it synchronously through the ResourceBridge and write it
+   * we take already-cached bytes synchronously and write them
    * into the bounded cache, so `fs.readFileSync(adapter.getFullPath(p))`
    * works for the file that was asked about. Files over the cache
    * limits are not fetched, and callers still get the joined path —
@@ -247,13 +248,13 @@ export class SftpDataAdapter {
     if (this.isConfigTree(normalizedPath)) {
       // Never ours (see isConfigTree); answer from the real disk only.
       return Boolean(this.shadowBasePath)
-        && fs.existsSync(nodePath.join(this.shadowBasePath, normalizedPath));
+        && this.physical.existsSync(nodePath.join(this.shadowBasePath, normalizedPath));
     }
     if (cache.has(normalizedPath)) return true;
     // Already real on disk — materialised earlier, or written by
     // somebody. One stat, no network.
     if (this.shadowBasePath
-      && fs.existsSync(nodePath.join(this.shadowBasePath, normalizedPath))) {
+      && this.physical.existsSync(nodePath.join(this.shadowBasePath, normalizedPath))) {
       return true;
     }
 
@@ -1059,7 +1060,7 @@ export class SftpDataAdapter {
       // Skipping costs nothing: the remote write already succeeded, and for
       // plugin CODE the local copy is owned by the pull/push binary
       // round-trip (`PLUGIN_BINARY_FILES`), not by this cache.
-      if (fs.lstatSync(abs, { throwIfNoEntry: false })?.isSymbolicLink()) {
+      if (this.physical.lstatSync(abs, { throwIfNoEntry: false })?.isSymbolicLink()) {
         logger.warn(`writeThroughConfig: "${rel}" is a symlink — not mirrored (would clobber its target)`);
         return;
       }
@@ -1067,14 +1068,14 @@ export class SftpDataAdapter {
       // whole-dir plugin symlink from an older build) would redirect the
       // write out of the shadow root even though `abs` looked contained.
       const dir = nodePath.dirname(abs);
-      const realDir = fs.existsSync(dir) ? fs.realpathSync(dir) : null;
+      const realDir = this.physical.existsSync(dir) ? this.physical.realpathSync(dir) : null;
       if (realDir && realDir !== root && !realDir.startsWith(root + nodePath.sep)) {
         logger.warn(`writeThroughConfig: "${rel}" resolves outside the shadow root via a symlinked parent — not mirrored`);
         return;
       }
 
-      fs.mkdirSync(dir, { recursive: true });
-      fs.writeFileSync(abs, data);
+      this.physical.mkdirSync(dir, { recursive: true });
+      this.physical.writeFileSync(abs, data);
     } catch (e) {
       // The remote write already succeeded — the session is correct either
       // way; only the next restart's warm start is degraded.
