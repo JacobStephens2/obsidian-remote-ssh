@@ -31,7 +31,7 @@ const nodeRequire = createRequire(import.meta.url);
 const cleanup: (() => void)[] = [];
 afterEach(() => { cleanup.splice(0).reverse().forEach(f => f()); vi.useRealTimers(); });
 
-function harness(settings = {}, eligible = true, filesystemBacked = true) {
+function harness(settings = {}, eligible = true, filesystemBacked = true, queueDisk = fs.promises) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'adapter-lifetime-'));
   cleanup.push(() => fs.rmSync(root, { recursive: true, force: true }));
   const events: ((event: string, filename: string | null) => void)[] = [];
@@ -43,6 +43,7 @@ function harness(settings = {}, eligible = true, filesystemBacked = true) {
   new Function('require', 'module', 'exports', bundle)((id: string) => {
     if (id === 'fs') return surface;
     if (id === 'fs/promises') return surface.promises;
+    if (id === 'node:fs/promises') return queueDisk;
     if (id === 'obsidian') return { ...obsidian, TFile, TFolder };
     return nodeRequire(id);
   }, module, module.exports);
@@ -77,6 +78,39 @@ function harness(settings = {}, eligible = true, filesystemBacked = true) {
 }
 
 describe('AdapterManager filesystem lifetime', () => {
+  it('does not let an interrupted queue open replace the live queue', async () => {
+    let release!: () => void;
+    let entered!: () => void;
+    const began = new Promise<void>(resolve => { entered = resolve; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    let first = true;
+    const queueDisk = { ...fs.promises, readFile: async (...args: Parameters<typeof fs.promises.readFile>) => {
+      if (!first) return fs.promises.readFile(...args);
+      first = false;
+      let value: Awaited<ReturnType<typeof fs.promises.readFile>> | undefined;
+      let failure: unknown;
+      try { value = await fs.promises.readFile(...args); } catch (e) { failure = e; }
+      entered();
+      await gate;
+      if (failure) throw failure;
+      return value!;
+    }};
+    const h = harness({}, true, true, queueDisk as typeof fs.promises);
+    const old = h.mgr.patch();
+    await began;
+    h.mgr.restore();
+    expect(await h.mgr.patch()).toBe(true);
+    const da = h.mgr.dataAdapter!;
+    da.setReconnecting(true);
+    await da.write('queued.md', 'offline edit');
+    da.setReconnecting(false);
+    release();
+    expect(await old).toBe(false);
+    await h.mgr.replayOfflineQueue('after-reconnect');
+    expect(h.remote.writeBinary).toHaveBeenCalledOnce();
+    expect(h.remote.writeBinary.mock.calls[0].slice(0, 2)).toEqual(['/remote/queued.md', Buffer.from('offline edit')]);
+  });
+
   it.each([[false, true], [true, false]])('keeps ordinary adapters when eligible=%s filesystem=%s', async (eligible, disk) => {
     const h = harness({}, eligible, disk);
     expect(await h.mgr.patch()).toBe(true);

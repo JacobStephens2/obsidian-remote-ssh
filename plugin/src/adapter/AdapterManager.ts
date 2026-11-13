@@ -227,8 +227,9 @@ export class AdapterManager {
     // reused on subsequent patches so the queue isn't re-replayed.
     if (!this.offlineQueue) {
       try {
-        this.offlineQueue = await this.openOfflineQueue();
+        const openedQueue = await this.openOfflineQueue();
         if (!lifetime.active) return false;
+        this.offlineQueue = openedQueue;
         const stats = this.offlineQueue.stats();
         if (stats.entries > 0) {
           logger.info(
@@ -242,6 +243,7 @@ export class AdapterManager {
         const queue = this.offlineQueue;
         this.pendingEditsBar.startPolling(() => queue.pending().length);
       } catch (e) {
+        if (!lifetime.active) return false;
         logger.warn(`OfflineQueue: open failed (${errorMessage(e)}); offline writes will throw`);
         this.offlineQueue = null;
       }
