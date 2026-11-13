@@ -126,7 +126,9 @@ export function makeLocalWriteIgnore(
 export class LocalWriteWatcher {
   private closer: { close(): void } | null = null;
   private timer: unknown = null;
-  private flushing = false;
+  private flushing: number | null = null;
+  private generation = 0;
+  private active = false;
   /** Paths with an observed change that has not yet been pushed. */
   private readonly dirty = new Set<string>();
   /** Last sample seen for a dirty path — the other half of the stability check. */
@@ -139,12 +141,24 @@ export class LocalWriteWatcher {
   constructor(private readonly deps: LocalWriteWatcherDeps) {}
 
   start(): void {
-    if (this.closer) return;
-    this.closer = this.deps.watch((rel) => this.onEvent(rel));
+    if (this.active) return;
+    this.active = true;
+    const generation = ++this.generation;
+    try {
+      this.closer = this.deps.watch((rel) => {
+        if (this.isLive(generation)) this.onEvent(rel);
+      });
+    } catch (e) {
+      this.stop();
+      throw e;
+    }
     logger.info('LocalWriteWatcher: watching the shadow vault root for out-of-band writes');
   }
 
   stop(): void {
+    this.active = false;
+    ++this.generation;
+    this.flushing = null;
     if (this.timer !== null) {
       this.deps.clearTimer(this.timer);
       this.timer = null;
@@ -181,34 +195,43 @@ export class LocalWriteWatcher {
   }
 
   private arm(): void {
+    if (!this.active) return;
+    const generation = this.generation;
     if (this.timer !== null) this.deps.clearTimer(this.timer);
     this.timer = this.deps.setTimer(() => {
+      if (!this.isLive(generation)) return;
       this.timer = null;
-      void this.flush();
+      void this.flush(generation);
     }, this.deps.debounceMs);
   }
 
-  private async flush(): Promise<void> {
-    if (this.flushing) {
+  private isLive(generation: number): boolean {
+    return this.active && this.generation === generation;
+  }
+
+  private async flush(generation: number): Promise<void> {
+    if (!this.isLive(generation)) return;
+    if (this.flushing === generation) {
       // A push is still in flight; come back after it lands rather
       // than interleaving two pushes for the same path.
       this.arm();
       return;
     }
-    this.flushing = true;
+    this.flushing = generation;
     const candidates = [...this.dirty];
     this.dirty.clear();
     try {
       for (const rel of candidates) {
-        await this.flushOne(rel);
+        if (!this.isLive(generation)) return;
+        await this.flushOne(rel, generation);
       }
     } finally {
-      this.flushing = false;
+      if (this.flushing === generation) this.flushing = null;
     }
-    if (this.dirty.size > 0) this.arm();
+    if (this.isLive(generation) && this.dirty.size > 0) this.arm();
   }
 
-  private async flushOne(rel: string): Promise<void> {
+  private async flushOne(rel: string, generation: number): Promise<void> {
     const st = this.deps.stat(rel);
 
     if (st === null) {
@@ -217,9 +240,11 @@ export class LocalWriteWatcher {
       if (sig === undefined) return;   // never ours — leave the remote alone
       try {
         await this.deps.removeRemote(rel);
+        if (!this.isLive(generation)) return;
         this.pushed.delete(rel);
         logger.info(`LocalWriteWatcher: "${rel}" deleted locally — removed on the remote`);
       } catch (e) {
+        if (!this.isLive(generation)) return;
         this.fail(rel, `could not delete "${rel}" on the remote: ${errorMessage(e)}`);
       }
       return;
@@ -263,10 +288,12 @@ export class LocalWriteWatcher {
     }
     try {
       await this.deps.push(rel, data);
+      if (!this.isLive(generation)) return;
       this.pushed.set(rel, sig);
       this.reported.delete(rel);
       logger.info(`LocalWriteWatcher: pushed out-of-band write "${rel}" (${data.length} bytes)`);
     } catch (e) {
+      if (!this.isLive(generation)) return;
       this.fail(rel, `could not push "${rel}" to the remote: ${errorMessage(e)}`);
     }
   }

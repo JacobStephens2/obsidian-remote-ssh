@@ -7,6 +7,11 @@ import { ReadCache } from '../cache/ReadCache';
 import { DirCache } from '../cache/DirCache';
 import { SftpDataAdapter } from './SftpDataAdapter';
 import { MaterializedCache } from './MaterializedCache';
+import { LocalWriteWatcher, makeLocalWriteIgnore } from './LocalWriteWatcher';
+import { FsModulePatcher } from './FsModulePatcher';
+import { capturePhysicalFs, type PhysicalFs } from './PhysicalFs';
+import { watchTree, listTreeFiles, physicalWatchTreeDeps } from '../util/watchTree';
+import { DEFAULT_WALK_IGNORE_DIRS } from '../constants';
 import { AdapterPatcher } from './AdapterPatcher';
 import { ResourceBridge } from './ResourceBridge';
 import { WriteConflictModal } from '../ui/WriteConflictModal';
@@ -25,7 +30,6 @@ import { PathMapper } from '../path/PathMapper';
 import { logger } from '../util/logger';
 import { errorMessage } from '../util/errorMessage';
 import * as path from 'path';
-import * as fs from 'fs';
 
 /**
  * The set of FileSystemAdapter methods that get monkey-patched onto
@@ -60,6 +64,7 @@ export const PATCHED_METHODS = [
 
 /**
  * Manages the lifetime of the monkey-patched `app.vault.adapter`,
+ * its bounded disk cache, local write-back, Node fs compatibility,
  * the ResourceBridge, and the OfflineQueue. Extracted from main.ts
  * so that adapter-lifecycle concerns are cohesive and independently
  * testable (issue #197).
@@ -76,6 +81,9 @@ export class AdapterManager {
   private offlineQueue: OfflineQueue | null = null;
   private resourceBridge: ResourceBridge | null = null;
   private materializedCache: MaterializedCache | null = null;
+  private localWriteWatcher: LocalWriteWatcher | null = null;
+  private fsModulePatcher: FsModulePatcher | null = null;
+  private lifetime: { active: boolean } | null = null;
 
   constructor(
     private readonly app: App,
@@ -91,15 +99,6 @@ export class AdapterManager {
     return this._dataAdapter;
   }
 
-  /**
-   * The session's materialisation ledger. `LocalWriteWatcher` consults
-   * it so a copy we put on disk is never pushed back to the remote as
-   * if the user had written it.
-   */
-  get materialized(): MaterializedCache | null {
-    return this.materializedCache;
-  }
-
   isPatched(): boolean {
     return this.patcher?.isPatched() ?? false;
   }
@@ -113,6 +112,21 @@ export class AdapterManager {
    * decides what notice (if any) to surface.
    */
   async patch(): Promise<boolean> {
+    if (this.lifetime) return this.isPatched();
+    const lifetime = { active: true };
+    this.lifetime = lifetime;
+    try {
+      const installed = await this.install(lifetime);
+      if (!installed && this.lifetime === lifetime) this.restore();
+      return installed;
+    } catch (e) {
+      logger.error(`Adapter patch failed: ${errorMessage(e)}`);
+      if (this.lifetime === lifetime) this.restore();
+      return false;
+    }
+  }
+
+  private async install(lifetime: { active: boolean }): Promise<boolean> {
     if (!this.conn.activeRemoteBasePath) {
       logger.warn('AdapterManager.patch: no active remote base path');
       return false;
@@ -133,6 +147,13 @@ export class AdapterManager {
     const shadowBasePath = this.app.vault.adapter instanceof FileSystemAdapter
       ? this.app.vault.adapter.getBasePath()
       : '';
+    const physical = capturePhysicalFs();
+    const settings = { ...this.getSettings() };
+    const configDir = this.app.vault.configDir;
+    const profile = this.conn.activeProfile;
+    const eligible = Boolean(shadowBasePath && profile
+      && settings.autoConnectProfileId === profile.id);
+    const ignoreDirs = [...(profile?.walkIgnoreDirs ?? DEFAULT_WALK_IGNORE_DIRS)];
     this.readCache = new ReadCache();
     this.dirCache = new DirCache();
     // Pick the transport that matches the active session: when an
@@ -161,6 +182,7 @@ export class AdapterManager {
     // requests get served from the daemon's resize path (small, cached)
     // instead of pulling the full original on every <img>.
     const bridge = new ResourceBridge();
+    this.resourceBridge = bridge;
     const fetchThumbnail = this.makeThumbnailFetcherIfSupported();
     const fetchBinaryRange = this.makeBinaryRangeFetcherIfSupported();
     try {
@@ -169,7 +191,10 @@ export class AdapterManager {
         fetchThumbnail ?? undefined,
         fetchBinaryRange ?? undefined,
       );
-      this.resourceBridge = bridge;
+      if (!lifetime.active) {
+        await bridge.stop();
+        return false;
+      }
       if (fetchThumbnail) {
         logger.info('ResourceBridge: thumbnail fast path enabled (daemon supports fs.thumbnail)');
       }
@@ -178,6 +203,8 @@ export class AdapterManager {
       }
     } catch (e) {
       logger.warn(`ResourceBridge: start failed: ${errorMessage(e)}`);
+      await bridge.stop().catch(() => {});
+      if (!lifetime.active) return false;
       this.resourceBridge = null;
     }
 
@@ -201,6 +228,7 @@ export class AdapterManager {
     if (!this.offlineQueue) {
       try {
         this.offlineQueue = await this.openOfflineQueue();
+        if (!lifetime.active) return false;
         const stats = this.offlineQueue.stats();
         if (stats.entries > 0) {
           logger.info(
@@ -218,6 +246,7 @@ export class AdapterManager {
         this.offlineQueue = null;
       }
     }
+    if (!lifetime.active) return false;
     const conflictResolver = new ConflictResolver(
       fsClient,
       this.readCache,
@@ -238,6 +267,7 @@ export class AdapterManager {
       this.offlineQueue,
       shadowBasePath,
       this.transferTracker,
+      physical,
     );
     this.patcher = new AdapterPatcher(targetAdapter, this._dataAdapter);
     try {
@@ -245,14 +275,7 @@ export class AdapterManager {
       logger.info(`Adapter patched via ${transportLabel}: [${PATCHED_METHODS.join(', ')}]`);
     } catch (e) {
       logger.error(`Adapter patch failed: ${errorMessage(e)}`);
-      this.patcher = null;
-      this._dataAdapter = null;
-      this.readCache = null;
-      this.dirCache = null;
-      // Patch failed before we ever served a URL, so no point keeping
-      // the bridge alive for nobody.
-      void this.stopResourceBridge();
-      return false;
+      throw e;
     }
 
     // Writer self-reflect (#341) — transport-independent. The adapter
@@ -265,23 +288,23 @@ export class AdapterManager {
     // Bounded on-demand disk cache behind getFullPath / getFilePath and
     // the read-through in read/readBinary. Zero budget switches the
     // whole thing off; nothing is ever pre-fetched either way.
-    this.materializedCache = new MaterializedCache({
+    if (eligible) this.materializedCache = new MaterializedCache({
       absOf: (rel) => path.join(shadowBasePath, rel),
       writeFile: (abs, data) => {
-        fs.mkdirSync(path.dirname(abs), { recursive: true });
-        fs.writeFileSync(abs, data);
-        const s = fs.statSync(abs, { throwIfNoEntry: false });
+        physical.mkdirSync(path.dirname(abs), { recursive: true });
+        physical.writeFileSync(abs, data);
+        const s = physical.statSync(abs, { throwIfNoEntry: false });
         return s ? { size: s.size, mtimeMs: s.mtimeMs } : null;
       },
       statFile: (abs) => {
-        const s = fs.statSync(abs, { throwIfNoEntry: false });
+        const s = physical.statSync(abs, { throwIfNoEntry: false });
         return s?.isFile() ? { size: s.size, mtimeMs: s.mtimeMs } : null;
       },
-      deleteFile: (abs) => fs.rmSync(abs, { force: true }),
+      deleteFile: (abs) => physical.rmSync(abs, { force: true }),
       budgetBytes: shadowBasePath
-        ? Math.max(0, this.getSettings().fsCacheMB ?? 128) * 1024 * 1024
+        ? Math.max(0, settings.fsCacheMB ?? 128) * 1024 * 1024
         : 0,
-      maxFileBytes: Math.max(0, this.getSettings().fsCacheMaxFileMB ?? 8) * 1024 * 1024,
+      maxFileBytes: Math.max(0, settings.fsCacheMaxFileMB ?? 8) * 1024 * 1024,
     });
     this._dataAdapter.setMaterializedCache(this.materializedCache);
 
@@ -290,6 +313,10 @@ export class AdapterManager {
       new VaultModelBuilder(this.app.vault, { TFile, TFolder }),
     );
     this._dataAdapter.setLocalOpRegistry(localOpRegistry);
+    if (eligible) {
+      this.activateCompatibility(this._dataAdapter, this.materializedCache!,
+        shadowBasePath, configDir, settings, ignoreDirs, physical, lifetime);
+    }
 
     // The live-update subscription is only meaningful on RPC (SFTP has
     // no notification channel). On RPC the daemon also echoes our own
@@ -309,15 +336,107 @@ export class AdapterManager {
     return true;
   }
 
+  private activateCompatibility(
+    da: SftpDataAdapter, cache: MaterializedCache, root: string,
+    configDir: string, settings: PluginSettings, ignoreDirs: readonly string[],
+    physical: PhysicalFs, lifetime: { active: boolean },
+  ): void {
+    const abs = (rel: string): string => path.join(root, rel);
+    if (settings.localWriteBack !== false) {
+      const ignore = makeLocalWriteIgnore(configDir, ignoreDirs);
+      const watcher = new LocalWriteWatcher({
+        watch: (onChange) => watchTree(root, onChange, ignore, physicalWatchTreeDeps(physical)),
+        scan: () => listTreeFiles(root, ignore, physical),
+        stat: (rel) => {
+          const s = physical.statSync(abs(rel), { throwIfNoEntry: false });
+          return s?.isFile() ? { size: s.size, mtimeMs: s.mtimeMs } : null;
+        },
+        read: (rel) => {
+          try { return physical.readFileSync(abs(rel)); } catch { return null; }
+        },
+        push: async (rel, data) => {
+          // Retain text conflict handling and immediate writer reflection.
+          if (rel.toLowerCase().endsWith('.md')) await da.write(rel, data.toString('utf-8'));
+          else await da.writeBinary(rel,
+            data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) as ArrayBuffer);
+        },
+        removeRemote: (rel) => da.remove(rel), ignore,
+        isMirroredCopy: (rel, stat) => cache.isMirroredCopy(rel, stat),
+        maxBytes: Math.max(1, settings.localWriteBackMaxMB ?? 32) * 1024 * 1024,
+        debounceMs: 400,
+        setTimer: (cb, ms) => window.setTimeout(cb, ms),
+        clearTimer: (handle) => window.clearTimeout(handle as number),
+        onError: (_rel, message) => new Notice(`Remote SSH: ${message}`),
+      });
+      try {
+        watcher.start();
+        this.localWriteWatcher = watcher;
+      } catch (e) {
+        watcher.stop();
+        logger.warn(`Local write watcher unavailable: ${errorMessage(e)}`);
+        new Notice(`Remote SSH: local writes cannot be watched — ${errorMessage(e)}`);
+      }
+    }
+    if (settings.fsModulePatch !== false) {
+      let patcher: FsModulePatcher | null = null;
+      try {
+        const req = (window as unknown as { require?: (m: string) => unknown }).require;
+        const fsModule = typeof req === 'function' ? req('fs') : null;
+        if (!fsModule) throw new Error('window.require fs unavailable');
+        const asEntry = (f: unknown) => {
+          if (f instanceof TFile) return { isDir: false, size: f.stat.size, mtimeMs: f.stat.mtime };
+          if (f instanceof TFolder) return { isDir: true, size: 0, mtimeMs: 0 };
+          return null;
+        };
+        patcher = new FsModulePatcher({
+          fsModule: fsModule as Record<string, unknown>, root, configDir,
+          tree: {
+            children: (rel) => {
+              const folder = rel === '' ? this.app.vault.getRoot() : this.app.vault.getAbstractFileByPath(rel);
+              if (!(folder instanceof TFolder)) return null;
+              return folder.children.flatMap(f => {
+                const entry = asEntry(f);
+                return entry ? [{ name: f.name, entry }] : [];
+              });
+            },
+            entry: rel => asEntry(this.app.vault.getAbstractFileByPath(rel)),
+          },
+          materialize: rel => lifetime.active && da.materializeSync(rel),
+          materializeAsync: async (rel) => {
+            const f = this.app.vault.getAbstractFileByPath(rel);
+            if (!lifetime.active || !(f instanceof TFile) || cache.disabled() || cache.tooBig(f.stat.size)) return false;
+            await da.readBinary(rel);
+            return lifetime.active && cache.has(rel);
+          },
+        });
+        if (patcher.patch()) this.fsModulePatcher = patcher;
+        else patcher.restore();
+      } catch (e) {
+        patcher?.restore();
+        logger.warn(`Node fs compatibility unavailable: ${errorMessage(e)}`);
+      }
+    }
+  }
+
   /**
-   * Drop the watch subscription, restore the original adapter, and
+   * Stop compatibility, drop the watch subscription, restore the original adapter, and
    * tear down the ResourceBridge. Idempotent.
    */
   restore(): void {
+    if (this.lifetime) this.lifetime.active = false;
+    this.lifetime = null;
+    const clean = (label: string, action: () => void): void => {
+      try { action(); } catch (e) { logger.error(`${label}: ${errorMessage(e)}`); }
+    };
+    clean('Local write watcher stop', () => this.localWriteWatcher?.stop());
+    this.localWriteWatcher = null;
+    clean('Node fs restore', () => this.fsModulePatcher?.restore());
+    this.fsModulePatcher = null;
+    clean('Detach materialised cache', () => this._dataAdapter?.setMaterializedCache(null));
     // Drop the watch subscription before tearing the adapter down so
     // any in-flight fs.changed callbacks find a still-valid adapter
     // (or, if the handler races, a null `dataAdapter` which it tolerates).
-    this.fsChangeListener.unsubscribe(this.conn.rpcConnection);
+    clean('Remote watch unsubscribe', () => this.fsChangeListener.unsubscribe(this.conn.rpcConnection));
     const wasPatched = this.patcher?.isPatched() ?? false;
     if (wasPatched) {
       try {
@@ -335,11 +454,11 @@ export class AdapterManager {
     // on the shadow disk so a disconnect leaves behind only what the
     // user (or a plugin) actually created there. A copy somebody edited
     // is left alone — the watcher owns it now.
-    this.materializedCache?.clear();
+    clean('Materialised cache clear', () => this.materializedCache?.clear());
     this.materializedCache = null;
-    this.ancestorTracker?.clear();
+    clean('Ancestor clear', () => this.ancestorTracker?.clear());
     this.ancestorTracker = null;
-    this.transferTracker?.clear();
+    clean('Transfer tracker clear', () => this.transferTracker?.clear());
     // Bridge tears down asynchronously; we don't await here because
     // restore() must remain sync for the connection-close hook.
     void this.stopResourceBridge();

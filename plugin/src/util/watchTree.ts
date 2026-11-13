@@ -2,6 +2,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { logger } from './logger';
 import { errorMessage } from './errorMessage';
+import { capturePhysicalFs, type PhysicalFs } from '../adapter/PhysicalFs';
 
 /** Handle returned by {@link watchTree}. `close()` is idempotent. */
 export interface TreeWatcher {
@@ -34,9 +35,9 @@ export interface WatchTreeDeps {
  */
 const MAX_WATCHED_DIRS = 2048;
 
-const nodeDeps: WatchTreeDeps = {
+export const physicalWatchTreeDeps = (physical: PhysicalFs): WatchTreeDeps => ({
   watch: (dir, recursive, onEvent) => {
-    const w = fs.watch(
+    const w = physical.watch(
       dir,
       { persistent: false, recursive },
       (_evt, filename) => onEvent(filename === null || filename === undefined ? null : String(filename)),
@@ -45,14 +46,17 @@ const nodeDeps: WatchTreeDeps = {
   },
   listDirs: (dir) => {
     try {
-      return fs.readdirSync(dir, { withFileTypes: true })
+      return physical.readdirSync(dir, { withFileTypes: true })
         .filter(e => e.isDirectory())
         .map(e => e.name);
     } catch {
       return [];
     }
   },
-};
+});
+
+const physical = capturePhysicalFs();
+const nodeDeps = physicalWatchTreeDeps(physical);
 
 /**
  * Watch `root` and everything under it, reporting each change as a
@@ -76,11 +80,13 @@ export function watchTree(
   prune: (relDir: string) => boolean = () => false,
   deps: WatchTreeDeps = nodeDeps,
 ): TreeWatcher {
+  let closed = false;
   try {
     const w = deps.watch(root, true, (filename) => {
+      if (closed) return;
       onChange(filename === null ? null : toPosix(filename));
     });
-    return { close: () => { try { w.close(); } catch { /* best effort */ } } };
+    return { close: () => { closed = true; try { w.close(); } catch { /* best effort */ } } };
   } catch (e) {
     logger.info(
       `watchTree: recursive watch unavailable (${errorMessage(e)}); ` +
@@ -89,7 +95,6 @@ export function watchTree(
   }
 
   const watchers = new Map<string, { close(): void }>();
-  let closed = false;
 
   const add = (relDir: string): void => {
     if (closed || watchers.has(relDir)) return;
@@ -105,6 +110,7 @@ export function watchTree(
     let w: { close(): void };
     try {
       w = deps.watch(abs, false, (filename) => {
+        if (closed) return;
         if (filename === null) {
           onChange(null);
           return;
@@ -117,6 +123,7 @@ export function watchTree(
         onChange(rel);
       });
     } catch (err) {
+      if (relDir === '') throw err;
       // Racing removal, or a permission we don't have. Not fatal: the
       // parent's watcher still reports changes to the directory entry.
       logger.info(`watchTree: cannot watch "${abs}" (${errorMessage(err)})`);
@@ -166,6 +173,7 @@ const MAX_SCAN_FILES = 20_000;
 export function listTreeFiles(
   root: string,
   prune: (rel: string) => boolean = () => false,
+  disk: Pick<PhysicalFs, 'readdirSync'> = physical,
 ): string[] {
   const found: string[] = [];
   const stack: string[] = [''];
@@ -173,7 +181,7 @@ export function listTreeFiles(
     const relDir = stack.pop()!;
     let entries: fs.Dirent[];
     try {
-      entries = fs.readdirSync(relDir === '' ? root : path.join(root, relDir), { withFileTypes: true });
+      entries = disk.readdirSync(relDir === '' ? root : path.join(root, relDir), { withFileTypes: true });
     } catch {
       continue;                       // vanished or unreadable — nothing to report
     }
