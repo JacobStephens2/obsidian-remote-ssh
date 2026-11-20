@@ -21,6 +21,101 @@ function isNonEmptyArray(v: unknown): boolean {
 }
 
 /**
+ * A community-plugin id may be interpolated into a remote plugin path
+ * and joined onto the local plugins directory. Keep it only when it is
+ * one path segment: non-empty, not `.` or `..`, and containing no
+ * directory separator (`/` or `\`) and no drive separator (`:`).
+ * `:` is not a separator on POSIX, but on Windows `C:other` is
+ * drive-relative: `path.resolve(plugins, "C:other")` lands on `other`.
+ */
+function isSinglePathSegmentPluginId(id: string): boolean {
+  return id !== '' && id !== '.' && id !== '..'
+    && !id.includes('/') && !id.includes('\\') && !id.includes(':');
+}
+
+/**
+ * Absolute path `rel` may be created at under the local plugins
+ * directory, or null when that write would leave it.
+ *
+ * Same resolved-path confinement as `SftpDataAdapter.writeThroughConfig`:
+ * `path.resolve` decides containment (a string prefix would admit a
+ * sibling such as `plugins-evil`, and `..` walks out). A symlink at
+ * the destination is refused, because `writeFile` follows it. A
+ * symlinked ancestor is judged by realpath: one that stays inside the
+ * plugins directory is still that directory; one that doesn't is a
+ * refusal. A plugins directory that does not exist yet has no symlink
+ * to follow, so a lexically contained path is allowed.
+ */
+function containedPluginCodePath(pluginsRoot: string, rel: string): string | null {
+  const root = path.resolve(pluginsRoot);
+  let abs: string;
+  try {
+    // Join first. `path.resolve(root, rel)` parses `rel` on its own, so
+    // a Windows drive-relative segment such as `C:other\main.js` resolves
+    // onto `other` instead of a directory named `C:other`.
+    const joined = path.join(root, rel);
+    abs = path.resolve(joined);
+    if (path.basename(path.dirname(abs)) !== path.basename(path.dirname(joined))) return null;
+  } catch {
+    return null;
+  }
+  if (abs === root || !abs.startsWith(root + path.sep)) return null;
+
+  try {
+    if (fs.lstatSync(abs, { throwIfNoEntry: false })?.isSymbolicLink()) return null;
+
+    let cursor = path.dirname(abs);
+    while (cursor !== root) {
+      if (fs.lstatSync(cursor, { throwIfNoEntry: false })) break;
+      const parent = path.dirname(cursor);
+      if (parent === cursor) return null;
+      cursor = parent;
+    }
+    if (!fs.existsSync(cursor)) return abs;
+    const realAncestor = fs.realpathSync(cursor);
+    const realRoot = fs.existsSync(root) ? fs.realpathSync(root) : root;
+    if (realAncestor !== realRoot && !realAncestor.startsWith(realRoot + path.sep)) return null;
+  } catch {
+    return null;
+  }
+  return abs;
+}
+
+/**
+ * Absolute plugin directory `id` may be created under the local plugins
+ * directory, or null when it would leave it.
+ *
+ * A symlink at the directory is not refused outright: `writeThroughConfig`
+ * allows an ancestor whose real path stays inside the root. The code
+ * file itself is still refused by {@link containedPluginCodePath},
+ * because `writeFile` would follow that link.
+ */
+function containedPluginDirectory(pluginsRoot: string, id: string): string | null {
+  const root = path.resolve(pluginsRoot);
+  let abs: string;
+  try {
+    // Join first so a drive-relative id (`C:other`) stays a literal
+    // segment. `path.resolve(root, id)` would land on `other`.
+    const joined = path.join(root, id);
+    abs = path.resolve(joined);
+    if (path.basename(abs) !== id) return null;
+  } catch {
+    return null;
+  }
+  if (abs === root || !abs.startsWith(root + path.sep)) return null;
+  try {
+    if (!fs.lstatSync(abs, { throwIfNoEntry: false })) return abs;
+    const real = fs.realpathSync(abs);
+    const realRoot = fs.existsSync(root) ? fs.realpathSync(root) : root;
+    if (real !== realRoot && !real.startsWith(realRoot + path.sep)) return null;
+    if (!fs.statSync(real).isDirectory()) return null;
+    return abs;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Narrow an unknown `secrets` (or `hostKeyStore`) blob to a plain
  * string-keyed record, defaulting to `{}` for anything that isn't a
  * non-array object. Keeps the #399 secret-merge below total even when a
@@ -887,9 +982,26 @@ export class ShadowVaultBootstrap {
     pluginIds: readonly string[],
   ): Promise<{ pulled: string[] }> {
     const pulled: string[] = [];
+    const pluginsRoot = path.join(localConfigDir, 'plugins');
     for (const id of pluginIds) {
       if (id === ShadowVaultBootstrap.SELF_PLUGIN_ID) continue;
-      const localPluginDir = path.join(localConfigDir, 'plugins', id);
+      // Parsed lists already drop these. A caller that passes a raw id
+      // must still not interpolate it into the remote plugin path.
+      if (!isSinglePathSegmentPluginId(id)) {
+        logger.warn(`pullPluginBinaries: ${id} skipped (not a single path segment)`);
+        continue;
+      }
+      const localPluginDir = containedPluginDirectory(pluginsRoot, id);
+      // Before mkdir or writeFile: the plugin directory and every code
+      // file must stay inside the local plugins directory.
+      if (
+        localPluginDir === null ||
+        ShadowVaultBootstrap.PLUGIN_BINARY_FILES.some((file) =>
+          containedPluginCodePath(pluginsRoot, path.join(id, file)) === null)
+      ) {
+        logger.warn(`pullPluginBinaries: ${id} skipped (outside the local plugins directory)`);
+        continue;
+      }
       const remoteManifest = `${remoteConfigDir}/plugins/${id}/manifest.json`;
       try {
         if (!(await reader.exists(remoteManifest))) continue; // no code on the remote
@@ -900,16 +1012,31 @@ export class ShadowVaultBootstrap {
           : null;
         // Skip unless absent locally, or the remote is strictly newer.
         if (localVer !== null && !ShadowVaultBootstrap.versionGt(remoteVer, localVer)) continue;
-        let staged = false;
+        const pending: { file: string; content: string }[] = [];
         for (const file of ShadowVaultBootstrap.PLUGIN_BINARY_FILES) {
           const remoteRel = `${remoteConfigDir}/plugins/${id}/${file}`;
           if (!(await reader.exists(remoteRel))) continue;
-          const content = await reader.read(remoteRel);
-          fs.mkdirSync(localPluginDir, { recursive: true });
-          ShadowVaultBootstrap.writeFileAtomic(path.join(localPluginDir, file), content);
-          staged = true;
+          pending.push({ file, content: await reader.read(remoteRel) });
         }
-        if (staged) pulled.push(id);
+        // Re-resolve after the remote read, before any local write. A
+        // symlink can appear in that gap. Refuse the whole id so a
+        // later file cannot leave a newer manifest behind.
+        const dirNow = containedPluginDirectory(pluginsRoot, id);
+        const toWrite: { dest: string; content: string }[] = [];
+        if (dirNow !== null) {
+          for (const item of pending) {
+            const dest = containedPluginCodePath(pluginsRoot, path.join(id, item.file));
+            if (dest === null) break;
+            toWrite.push({ dest, content: item.content });
+          }
+        }
+        if (dirNow === null || toWrite.length !== pending.length) {
+          logger.warn(`pullPluginBinaries: ${id} skipped (outside the local plugins directory)`);
+          continue;
+        }
+        if (toWrite.length === 0) continue;
+        ShadowVaultBootstrap.writePluginCodeFiles(dirNow, toWrite);
+        pulled.push(id);
       } catch (e) {
         logger.warn(`pullPluginBinaries: ${id} skipped (${errorMessage(e)})`);
       }
@@ -986,24 +1113,50 @@ export class ShadowVaultBootstrap {
     return false;
   }
 
-  /** Atomic (tmp + rename) write of arbitrary file content. */
-  private static writeFileAtomic(localFile: string, content: string): void {
-    const tmp = `${localFile}.${process.pid}.tmp`;
-    fs.writeFileSync(tmp, content, 'utf-8');
+  /**
+   * Write every code file, or none of them.
+   *
+   * Each temp is created with `wx` (`O_EXCL`). A symlink already at that
+   * path fails with EEXIST; `writeFileSync` would otherwise follow it
+   * and write outside the plugins directory. Renames run only after
+   * every temp exists, so a failed later file cannot publish a newer
+   * manifest on its own.
+   */
+  private static writePluginCodeFiles(
+    dir: string,
+    files: readonly { dest: string; content: string }[],
+  ): void {
+    const created: string[] = [];
     try {
-      fs.renameSync(tmp, localFile);
+      fs.mkdirSync(dir, { recursive: true });
+      for (const file of files) {
+        const tmp = `${file.dest}.${process.pid}.tmp`;
+        fs.writeFileSync(tmp, file.content, { encoding: 'utf-8', flag: 'wx' });
+        created.push(tmp);
+      }
+      for (let i = 0; i < files.length; i++) {
+        fs.renameSync(created[i], files[i].dest);
+      }
     } catch (e) {
-      try { fs.unlinkSync(tmp); } catch { /* best effort */ }
+      for (const tmp of created) {
+        try { fs.unlinkSync(tmp); } catch { /* best effort */ }
+      }
       throw e;
     }
   }
 
-  /** Parse a community-plugins.json body into a string-id array, or null if malformed. */
+  /**
+   * Parse a community-plugins.json body into a string-id array, or null
+   * if malformed. Ids that are not a single path segment are dropped
+   * here, so a later pull does not interpolate them into a remote
+   * plugin path.
+   */
   private static parsePluginIdList(content: string): string[] | null {
     try {
       const parsed: unknown = JSON.parse(content);
       if (!Array.isArray(parsed)) return null;
-      return (parsed as unknown[]).filter((s): s is string => typeof s === 'string');
+      return (parsed as unknown[]).filter((s): s is string =>
+        typeof s === 'string' && isSinglePathSegmentPluginId(s));
     } catch {
       return null;
     }

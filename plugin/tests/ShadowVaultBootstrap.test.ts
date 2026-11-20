@@ -1163,6 +1163,23 @@ describe('ShadowVaultBootstrap community-plugins round-trip (#429 / #342)', () =
     );
   });
 
+  it('drops enabled-plugin ids that are not a single path segment, so they are not kept for a plugin-path pull', async () => {
+    const localConfigDir = makeLocalConfigDir(['remote-ssh', 'nested/id']);
+    const remote: Record<string, string> = {
+      '.obsidian/community-plugins.json': JSON.stringify(['dataview', '', '.', '..', '../escaped', 'win\\id', 'C:dataview']),
+    };
+    const reader: SharedConfigReader = {
+      exists: (p) => Promise.resolve(p in remote),
+      read: (p) => Promise.resolve(remote[p]),
+    };
+
+    const { merged } = await ShadowVaultBootstrap.pullCommunityPlugins(reader, '.obsidian', localConfigDir);
+
+    expect(merged).toEqual(['remote-ssh', 'dataview']);
+    expect(readLocal(localConfigDir)).toEqual(['remote-ssh', 'dataview']);
+    expect(ShadowVaultBootstrap.readEnabledPluginIds(localConfigDir)).toEqual(['remote-ssh', 'dataview']);
+  });
+
   // Reader+writer fake backed by an in-memory store. `read` can be made
   // to throw to simulate a transient SSH error mid-read.
   function makeRemoteRW(initial?: string[], readThrows = false): {
@@ -1666,6 +1683,204 @@ describe('ShadowVaultBootstrap plugin-binary round-trip (#429b — BRAT / non-ma
 
     expect(pulled, 'good pulls even though bad errored').toContain('good');
     expect(pulled).not.toContain('bad');
+  });
+
+  it('does not write plugin code outside the local plugins directory', async () => {
+    const cfg = makeLocalConfigDir();
+    const pluginsDir = path.join(cfg, 'plugins');
+    const escapedName = `escaped-${process.pid}`;
+    const parentEscape = `../../${escapedName}`;
+    const siblingEscape = '../plugins-evil';
+    const parentVictim = path.resolve(cfg, '..', escapedName, 'main.js');
+    const siblingVictim = path.join(cfg, 'plugins-evil', 'main.js');
+    const seen: string[] = [];
+    const { rw } = makeRW({
+      [`.obsidian/plugins/${parentEscape}/manifest.json`]: manifest('x', '1.0.0'),
+      [`.obsidian/plugins/${parentEscape}/main.js`]: '/* escaped */\n',
+      [`.obsidian/plugins/${siblingEscape}/manifest.json`]: manifest('y', '1.0.0'),
+      [`.obsidian/plugins/${siblingEscape}/main.js`]: '/* sibling */\n',
+      '.obsidian/plugins/brat-x/manifest.json': manifest('brat-x', '1.0.0'),
+      '.obsidian/plugins/brat-x/main.js': '/* brat code */\n',
+    });
+    const exists = rw.exists.bind(rw);
+    const read = rw.read.bind(rw);
+    rw.exists = (p) => { seen.push(p); return exists(p); };
+    rw.read = (p) => { seen.push(p); return read(p); };
+
+    const { pulled } = await ShadowVaultBootstrap.pullPluginBinaries(
+      rw, '.obsidian', cfg, [parentEscape, siblingEscape, 'brat-x'],
+    );
+
+    expect(pulled).not.toContain(parentEscape);
+    expect(pulled).not.toContain(siblingEscape);
+    expect(seen.some((p) => p.includes('..') || p.includes('plugins-evil'))).toBe(false);
+    expect(fs.existsSync(parentVictim), 'a .. id must not write outside the plugins directory').toBe(false);
+    expect(fs.existsSync(siblingVictim), 'a sibling of the plugins directory must not be written').toBe(false);
+    expect(fs.existsSync(path.join(pluginsDir, escapedName)), 'the escaped id must not be created under plugins').toBe(false);
+    expect(pulled).toContain('brat-x');
+    expect(fs.readFileSync(pluginFile(cfg, 'brat-x', 'main.js'), 'utf-8')).toBe('/* brat code */\n');
+  });
+
+  it('does not follow a plugin-directory symlink out of the local plugins directory', async () => {
+    const cfg = makeLocalConfigDir();
+    const pluginsDir = path.join(cfg, 'plugins');
+    fs.mkdirSync(pluginsDir, { recursive: true });
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'plugin-pull-outside-'));
+    const outsideMain = path.join(outside, 'main.js');
+    fs.writeFileSync(outsideMain, 'keep', 'utf-8');
+    const link = path.join(pluginsDir, 'evil');
+    try {
+      fs.symlinkSync(outside, link, 'dir');
+    } catch (e) {
+      console.warn(`skipping: cannot create symlink in test env: ${(e as Error).message}`);
+      return;
+    }
+    const { rw } = makeRW({
+      '.obsidian/plugins/evil/manifest.json': manifest('evil', '1.0.0'),
+      '.obsidian/plugins/evil/main.js': '/* pwned */\n',
+    });
+
+    const { pulled } = await ShadowVaultBootstrap.pullPluginBinaries(rw, '.obsidian', cfg, ['evil']);
+
+    expect(pulled).not.toContain('evil');
+    expect(fs.readFileSync(outsideMain, 'utf-8'), 'pull must not write through a symlinked plugin dir').toBe('keep');
+    expect(fs.lstatSync(link).isSymbolicLink()).toBe(true);
+  });
+
+  it('does not follow a plugin-file symlink out of the local plugins directory', async () => {
+    const cfg = makeLocalConfigDir();
+    const pluginDir = path.join(cfg, 'plugins', 'evil');
+    fs.mkdirSync(pluginDir, { recursive: true });
+    fs.writeFileSync(path.join(pluginDir, 'manifest.json'), manifest('evil', '1.0.0'), 'utf-8');
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'plugin-pull-file-'));
+    const outsideMain = path.join(outside, 'main.js');
+    fs.writeFileSync(outsideMain, 'keep', 'utf-8');
+    const link = path.join(pluginDir, 'main.js');
+    try {
+      fs.symlinkSync(outsideMain, link);
+    } catch (e) {
+      console.warn(`skipping: cannot create symlink in test env: ${(e as Error).message}`);
+      return;
+    }
+    const { rw } = makeRW({
+      '.obsidian/plugins/evil/manifest.json': manifest('evil', '2.0.0'),
+      '.obsidian/plugins/evil/main.js': '/* pwned */\n',
+    });
+
+    const { pulled } = await ShadowVaultBootstrap.pullPluginBinaries(rw, '.obsidian', cfg, ['evil']);
+
+    expect(pulled).not.toContain('evil');
+    expect(fs.readFileSync(outsideMain, 'utf-8'), 'pull must not overwrite a symlinked code file').toBe('keep');
+    expect(fs.lstatSync(link).isSymbolicLink()).toBe(true);
+  });
+
+  it('keeps only a single path segment when the enabled-plugin list is parsed', () => {
+    const cfg = makeLocalConfigDir();
+    fs.writeFileSync(
+      path.join(cfg, 'community-plugins.json'),
+      JSON.stringify(['dataview', '', '.', '..', 'nested/id', 'win\\id', 'C:remote-ssh', 'templater-obsidian']),
+      'utf-8',
+    );
+
+    expect(ShadowVaultBootstrap.readEnabledPluginIds(cfg)).toEqual(['dataview', 'templater-obsidian']);
+  });
+
+  it('does not follow a symlink at the atomic temp path', async () => {
+    const cfg = makeLocalConfigDir();
+    const pluginDir = path.join(cfg, 'plugins', 'evil');
+    fs.mkdirSync(pluginDir, { recursive: true });
+    fs.writeFileSync(path.join(pluginDir, 'manifest.json'), manifest('evil', '1.0.0'));
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'plugin-pull-tmp-'));
+    const victim = path.join(outside, 'secret.js');
+    fs.writeFileSync(victim, 'keep', 'utf-8');
+    const tmpLink = path.join(pluginDir, `main.js.${process.pid}.tmp`);
+    fs.symlinkSync(victim, tmpLink);
+    const { rw } = makeRW({
+      '.obsidian/plugins/evil/manifest.json': manifest('evil', '2.0.0'),
+      '.obsidian/plugins/evil/main.js': '/* pwned */\n',
+    });
+
+    const { pulled } = await ShadowVaultBootstrap.pullPluginBinaries(rw, '.obsidian', cfg, ['evil']);
+
+    expect(fs.readFileSync(victim, 'utf-8')).toBe('keep');
+    expect(pulled).not.toContain('evil');
+    expect(fs.lstatSync(tmpLink).isSymbolicLink()).toBe(true);
+    expect(fs.existsSync(path.join(pluginDir, 'main.js'))).toBe(false);
+  });
+
+  it('does not follow a symlink at the atomic-write temp path', async () => {
+    const cfg = makeLocalConfigDir();
+    const pluginDir = path.join(cfg, 'plugins', 'evil');
+    fs.mkdirSync(pluginDir, { recursive: true });
+    fs.writeFileSync(path.join(pluginDir, 'manifest.json'), manifest('evil', '1.0.0'), 'utf-8');
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'plugin-pull-tmp-'));
+    const outsideMain = path.join(outside, 'main.js');
+    fs.writeFileSync(outsideMain, 'keep', 'utf-8');
+    fs.symlinkSync(outsideMain, path.join(pluginDir, `main.js.${process.pid}.tmp`));
+    const { rw } = makeRW({
+      '.obsidian/plugins/evil/manifest.json': manifest('evil', '2.0.0'),
+      '.obsidian/plugins/evil/main.js': '/* pwned */\n',
+    });
+
+    await ShadowVaultBootstrap.pullPluginBinaries(rw, '.obsidian', cfg, ['evil']);
+
+    expect(fs.readFileSync(outsideMain, 'utf-8'), 'pull must not write through the atomic temp symlink').toBe('keep');
+  });
+
+  it('does not keep a new manifest when a later code file is refused', async () => {
+    const cfg = makeLocalConfigDir();
+    const pluginDir = path.join(cfg, 'plugins', 'p');
+    fs.mkdirSync(pluginDir, { recursive: true });
+    fs.writeFileSync(path.join(pluginDir, 'manifest.json'), manifest('p', '1.0.0'));
+    fs.writeFileSync(path.join(pluginDir, 'main.js'), '/* OLD */\n');
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'plugin-pull-stall-'));
+    const victim = path.join(outside, 'secret.js');
+    fs.writeFileSync(victim, 'keep', 'utf-8');
+    const store: Record<string, string> = {
+      '.obsidian/plugins/p/manifest.json': manifest('p', '2.0.0'),
+      '.obsidian/plugins/p/main.js': '/* NEW */\n',
+    };
+    const { rw } = makeRW(store);
+    const read = rw.read.bind(rw);
+    // Plant the symlink once. The retry must be able to read main.js
+    // after the test removes that link; a second plant would unlink a
+    // path that is already gone.
+    let planted = false;
+    rw.read = async (p: string) => {
+      if (!planted && p.endsWith('/p/main.js')) {
+        planted = true;
+        const link = path.join(pluginDir, 'main.js');
+        fs.unlinkSync(link);
+        fs.symlinkSync(victim, link);
+      }
+      return read(p);
+    };
+
+    await ShadowVaultBootstrap.pullPluginBinaries(rw, '.obsidian', cfg, ['p']);
+    fs.unlinkSync(path.join(pluginDir, 'main.js'));
+    const again = await ShadowVaultBootstrap.pullPluginBinaries(rw, '.obsidian', cfg, ['p']);
+
+    expect(again.pulled).toContain('p');
+    expect(fs.readFileSync(path.join(pluginDir, 'main.js'), 'utf-8')).toBe('/* NEW */\n');
+  });
+
+  it('pulls through a plugin-directory symlink that stays inside the plugins directory', async () => {
+    const cfg = makeLocalConfigDir();
+    const pluginsDir = path.join(cfg, 'plugins');
+    const real = path.join(pluginsDir, 'real-plugin');
+    fs.mkdirSync(real, { recursive: true });
+    fs.writeFileSync(path.join(real, 'manifest.json'), manifest('alias', '1.0.0'), 'utf-8');
+    fs.writeFileSync(path.join(real, 'main.js'), 'old\n', 'utf-8');
+    fs.symlinkSync(real, path.join(pluginsDir, 'alias'), 'dir');
+    const { rw } = makeRW({
+      '.obsidian/plugins/alias/manifest.json': manifest('alias', '2.0.0'),
+      '.obsidian/plugins/alias/main.js': '/* new */\n',
+    });
+
+    const { pulled } = await ShadowVaultBootstrap.pullPluginBinaries(rw, '.obsidian', cfg, ['alias']);
+
+    expect(pulled).toContain('alias');
+    expect(fs.readFileSync(path.join(real, 'main.js'), 'utf-8')).toBe('/* new */\n');
   });
 });
 
