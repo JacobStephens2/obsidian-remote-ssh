@@ -1166,7 +1166,7 @@ describe('ShadowVaultBootstrap community-plugins round-trip (#429 / #342)', () =
   it('drops enabled-plugin ids that are not a single path segment, so they are not kept for a plugin-path pull', async () => {
     const localConfigDir = makeLocalConfigDir(['remote-ssh', 'nested/id']);
     const remote: Record<string, string> = {
-      '.obsidian/community-plugins.json': JSON.stringify(['dataview', '', '.', '..', '../escaped', 'win\\id']),
+      '.obsidian/community-plugins.json': JSON.stringify(['dataview', '', '.', '..', '../escaped', 'win\\id', 'C:dataview']),
     };
     const reader: SharedConfigReader = {
       exists: (p) => Promise.resolve(p in remote),
@@ -1778,7 +1778,7 @@ describe('ShadowVaultBootstrap plugin-binary round-trip (#429b — BRAT / non-ma
     const cfg = makeLocalConfigDir();
     fs.writeFileSync(
       path.join(cfg, 'community-plugins.json'),
-      JSON.stringify(['dataview', '', '.', '..', 'nested/id', 'win\\id', 'templater-obsidian']),
+      JSON.stringify(['dataview', '', '.', '..', 'nested/id', 'win\\id', 'C:remote-ssh', 'templater-obsidian']),
       'utf-8',
     );
 

@@ -24,11 +24,13 @@ function isNonEmptyArray(v: unknown): boolean {
  * A community-plugin id may be interpolated into a remote plugin path
  * and joined onto the local plugins directory. Keep it only when it is
  * one path segment: non-empty, not `.` or `..`, and containing no
- * directory separator (`/` or `\`, either of which is a separator on
- * at least one platform).
+ * directory separator (`/` or `\`) and no drive separator (`:`).
+ * `:` is not a separator on POSIX, but on Windows `C:other` is
+ * drive-relative: `path.resolve(plugins, "C:other")` lands on `other`.
  */
 function isSinglePathSegmentPluginId(id: string): boolean {
-  return id !== '' && id !== '.' && id !== '..' && !id.includes('/') && !id.includes('\\');
+  return id !== '' && id !== '.' && id !== '..'
+    && !id.includes('/') && !id.includes('\\') && !id.includes(':');
 }
 
 /**
@@ -48,7 +50,12 @@ function containedPluginCodePath(pluginsRoot: string, rel: string): string | nul
   const root = path.resolve(pluginsRoot);
   let abs: string;
   try {
-    abs = path.resolve(root, rel);
+    // Join first. `path.resolve(root, rel)` parses `rel` on its own, so
+    // a Windows drive-relative segment such as `C:other\main.js` resolves
+    // onto `other` instead of a directory named `C:other`.
+    const joined = path.join(root, rel);
+    abs = path.resolve(joined);
+    if (path.basename(path.dirname(abs)) !== path.basename(path.dirname(joined))) return null;
   } catch {
     return null;
   }
@@ -87,7 +94,11 @@ function containedPluginDirectory(pluginsRoot: string, id: string): string | nul
   const root = path.resolve(pluginsRoot);
   let abs: string;
   try {
-    abs = path.resolve(root, id);
+    // Join first so a drive-relative id (`C:other`) stays a literal
+    // segment. `path.resolve(root, id)` would land on `other`.
+    const joined = path.join(root, id);
+    abs = path.resolve(joined);
+    if (path.basename(abs) !== id) return null;
   } catch {
     return null;
   }
