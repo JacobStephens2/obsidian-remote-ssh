@@ -343,10 +343,10 @@ command.
 
 `onLayoutReady` hook in `main.ts` reads `autoConnectProfileId` and
 runs `runAutoConnect`. The new shadow window self-connects, patches
-its own adapter, runs `populateVaultFromRemote`, and File Explorer
-fills with the remote tree without further user input. The
-`Reconnect` command lets the user retry from inside the shadow
-window after a transient connect failure.
+its own adapter, and starts Vault population. The same lifetime owns the
+initial load, folder expansion, and background registration. A lazy startup
+registers the root first and fills the remaining tree in the background.
+The `Reconnect` command uses the same startup path inside the shadow window.
 
 ### Phase 5 deliverable (shipped)
 

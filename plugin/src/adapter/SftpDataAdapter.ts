@@ -421,7 +421,8 @@ export class SftpDataAdapter {
     }
   }
 
-  async list(normalizedPath: string): Promise<ListedFiles> {
+  async list(normalizedPath: string, signal?: AbortSignal): Promise<ListedFiles> {
+    signal?.throwIfAborted();
     if (this.reconnecting) throw reconnectingError();
     const plan = this.planList(normalizedPath);
     const primaryRemote = this.joinRemote(plan.primary);
@@ -429,6 +430,7 @@ export class SftpDataAdapter {
     let primaryEntries = this.dirCache.get(primaryRemote);
     if (!primaryEntries) {
       primaryEntries = await this.client.list(primaryRemote);
+      signal?.throwIfAborted();
       this.dirCache.put(primaryRemote, primaryEntries);
     }
     if (plan.hideUserDirName) {
@@ -440,10 +442,13 @@ export class SftpDataAdapter {
       const userRemote = this.joinRemote(plan.userSubtree);
       let cached = this.dirCache.get(userRemote);
       if (!cached) {
+        signal?.throwIfAborted();
         try {
           cached = await this.client.list(userRemote);
+          signal?.throwIfAborted();
           this.dirCache.put(userRemote, cached);
         } catch {
+          signal?.throwIfAborted();
           // The per-client subtree doesn't exist yet — that's fine on
           // first connect, no entries to merge.
           cached = [];

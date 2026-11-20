@@ -113,6 +113,9 @@ Trust a host-key fingerprint for the current session only — held in RAM, dropp
 
 ## V
 
+**Vault population**
+The process of registering the remote tree in the shadow vault's in-memory model for File Explorer, search, graph, and links.
+
 **Vault root**
 The absolute path on the remote filesystem that the daemon treats as the vault. Configured per-profile. The daemon refuses any path that escapes this root (`PathOutsideVault` error).
 

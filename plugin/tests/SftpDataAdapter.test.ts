@@ -311,6 +311,25 @@ describe('SftpDataAdapter (read-side)', () => {
       await adapter.list('docs');
       expect(fake.spies.list).toHaveBeenCalledTimes(1);
     });
+
+    it('does not cache a late population listing after the transport is rebound', async () => {
+      const old = makeFakeClient();
+      const rebound = makeFakeClient({ dirs: { '/v/docs': [e('new.md')] } });
+      let settle!: (entries: RemoteEntry[]) => void;
+      old.spies.list.mockReturnValueOnce(new Promise(resolve => { settle = resolve; }));
+      const adapter = new SftpDataAdapter(old.client, '/v', readCache, dirCache, 'v');
+      const run = new AbortController();
+      const pending = adapter.list('docs', run.signal);
+
+      run.abort();
+      adapter.swapClient(rebound.client);
+      settle([e('old.md')]);
+      await expect(pending).rejects.toMatchObject({ name: 'AbortError' });
+      await expect(adapter.list('docs', new AbortController().signal)).resolves.toEqual({
+        folders: [], files: ['docs/new.md'],
+      });
+      expect(rebound.spies.list).toHaveBeenCalledWith('/v/docs');
+    });
   });
 
   describe('read', () => {
