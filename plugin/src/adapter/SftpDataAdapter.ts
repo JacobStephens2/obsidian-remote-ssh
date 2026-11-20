@@ -72,6 +72,8 @@ export type { ThreeWayPanes, TextConflictDecision } from '../conflict/ConflictRe
  * boundary later.
  */
 export class SftpDataAdapter {
+  private listingRevision = 0;
+
   constructor(
     private client: RemoteFsClient,
     /** Normalized remote base path (no trailing slash, no leading "~/"). */
@@ -291,6 +293,7 @@ export class SftpDataAdapter {
   swapClient(newClient: RemoteFsClient, remoteBasePath = this.remoteBasePath): void {
     this.client = newClient;
     this.remoteBasePath = remoteBasePath;
+    this.listingRevision++;
     this.dirCache.clear();
     this.conflictResolver?.swapClient(newClient);
   }
@@ -428,27 +431,30 @@ export class SftpDataAdapter {
     if (this.reconnecting) throw reconnectingError();
     const plan = this.planList(normalizedPath);
     const primaryRemote = this.joinRemote(plan.primary);
-
-    let primaryEntries = this.dirCache.get(primaryRemote);
-    if (!primaryEntries) {
-      primaryEntries = await this.client.list(primaryRemote);
+    const userRemote = plan.mergeFromUser && plan.userSubtree ? this.joinRemote(plan.userSubtree) : null;
+    const { client, listingRevision } = this;
+    const readListing = async (remotePath: string) => {
       signal?.throwIfAborted();
-      this.dirCache.put(primaryRemote, primaryEntries);
-    }
+      const entries = await client.list(remotePath);
+      signal?.throwIfAborted();
+      // Ordinary reads may finish after a rebind with no signal. Their caller
+      // can still use the result, but the new generation needs a fresh cache.
+      if (listingRevision === this.listingRevision) this.dirCache.put(remotePath, entries);
+      return entries;
+    };
+
+    let primaryEntries = this.dirCache.get(primaryRemote) ?? await readListing(primaryRemote);
+    signal?.throwIfAborted();
     if (plan.hideUserDirName) {
       primaryEntries = primaryEntries.filter(e => e.name !== plan.hideUserDirName);
     }
 
     let userEntries: RemoteEntry[] = [];
-    if (plan.mergeFromUser && plan.userSubtree) {
-      const userRemote = this.joinRemote(plan.userSubtree);
+    if (userRemote !== null) {
       let cached = this.dirCache.get(userRemote);
       if (!cached) {
-        signal?.throwIfAborted();
         try {
-          cached = await this.client.list(userRemote);
-          signal?.throwIfAborted();
-          this.dirCache.put(userRemote, cached);
+          cached = await readListing(userRemote);
         } catch {
           signal?.throwIfAborted();
           // The per-client subtree doesn't exist yet — that's fine on
@@ -458,6 +464,7 @@ export class SftpDataAdapter {
       }
       userEntries = cached;
     }
+    signal?.throwIfAborted();
 
     const files: string[] = [];
     const folders: string[] = [];
