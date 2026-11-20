@@ -75,6 +75,36 @@ function containedPluginCodePath(pluginsRoot: string, rel: string): string | nul
 }
 
 /**
+ * Absolute plugin directory `id` may be created under the local plugins
+ * directory, or null when it would leave it.
+ *
+ * A symlink at the directory is not refused outright: `writeThroughConfig`
+ * allows an ancestor whose real path stays inside the root. The code
+ * file itself is still refused by {@link containedPluginCodePath},
+ * because `writeFile` would follow that link.
+ */
+function containedPluginDirectory(pluginsRoot: string, id: string): string | null {
+  const root = path.resolve(pluginsRoot);
+  let abs: string;
+  try {
+    abs = path.resolve(root, id);
+  } catch {
+    return null;
+  }
+  if (abs === root || !abs.startsWith(root + path.sep)) return null;
+  try {
+    if (!fs.lstatSync(abs, { throwIfNoEntry: false })) return abs;
+    const real = fs.realpathSync(abs);
+    const realRoot = fs.existsSync(root) ? fs.realpathSync(root) : root;
+    if (real !== realRoot && !real.startsWith(realRoot + path.sep)) return null;
+    if (!fs.statSync(real).isDirectory()) return null;
+    return abs;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Narrow an unknown `secrets` (or `hostKeyStore`) blob to a plain
  * string-keyed record, defaulting to `{}` for anything that isn't a
  * non-array object. Keeps the #399 secret-merge below total even when a
@@ -950,7 +980,7 @@ export class ShadowVaultBootstrap {
         logger.warn(`pullPluginBinaries: ${id} skipped (not a single path segment)`);
         continue;
       }
-      const localPluginDir = containedPluginCodePath(pluginsRoot, id);
+      const localPluginDir = containedPluginDirectory(pluginsRoot, id);
       // Before mkdir or writeFile: the plugin directory and every code
       // file must stay inside the local plugins directory.
       if (
@@ -971,30 +1001,31 @@ export class ShadowVaultBootstrap {
           : null;
         // Skip unless absent locally, or the remote is strictly newer.
         if (localVer !== null && !ShadowVaultBootstrap.versionGt(remoteVer, localVer)) continue;
-        let staged = false;
-        let blocked = false;
+        const pending: { file: string; content: string }[] = [];
         for (const file of ShadowVaultBootstrap.PLUGIN_BINARY_FILES) {
           const remoteRel = `${remoteConfigDir}/plugins/${id}/${file}`;
           if (!(await reader.exists(remoteRel))) continue;
-          const content = await reader.read(remoteRel);
-          // Resolve again immediately before mkdir/write. The earlier
-          // check ran before the remote read, and a symlink can appear
-          // in that gap.
-          const dest = containedPluginCodePath(pluginsRoot, path.join(id, file));
-          const dirNow = containedPluginCodePath(pluginsRoot, id);
-          if (dest === null || dirNow === null) {
-            blocked = true;
-            break;
-          }
-          fs.mkdirSync(dirNow, { recursive: true });
-          ShadowVaultBootstrap.writeFileAtomic(dest, content);
-          staged = true;
+          pending.push({ file, content: await reader.read(remoteRel) });
         }
-        if (blocked) {
+        // Re-resolve after the remote read, before any local write. A
+        // symlink can appear in that gap. Refuse the whole id so a
+        // later file cannot leave a newer manifest behind.
+        const dirNow = containedPluginDirectory(pluginsRoot, id);
+        const toWrite: { dest: string; content: string }[] = [];
+        if (dirNow !== null) {
+          for (const item of pending) {
+            const dest = containedPluginCodePath(pluginsRoot, path.join(id, item.file));
+            if (dest === null) break;
+            toWrite.push({ dest, content: item.content });
+          }
+        }
+        if (dirNow === null || toWrite.length !== pending.length) {
           logger.warn(`pullPluginBinaries: ${id} skipped (outside the local plugins directory)`);
           continue;
         }
-        if (staged) pulled.push(id);
+        if (toWrite.length === 0) continue;
+        ShadowVaultBootstrap.writePluginCodeFiles(dirNow, toWrite);
+        pulled.push(id);
       } catch (e) {
         logger.warn(`pullPluginBinaries: ${id} skipped (${errorMessage(e)})`);
       }
@@ -1071,14 +1102,34 @@ export class ShadowVaultBootstrap {
     return false;
   }
 
-  /** Atomic (tmp + rename) write of arbitrary file content. */
-  private static writeFileAtomic(localFile: string, content: string): void {
-    const tmp = `${localFile}.${process.pid}.tmp`;
-    fs.writeFileSync(tmp, content, 'utf-8');
+  /**
+   * Write every code file, or none of them.
+   *
+   * Each temp is created with `wx` (`O_EXCL`). A symlink already at that
+   * path fails with EEXIST; `writeFileSync` would otherwise follow it
+   * and write outside the plugins directory. Renames run only after
+   * every temp exists, so a failed later file cannot publish a newer
+   * manifest on its own.
+   */
+  private static writePluginCodeFiles(
+    dir: string,
+    files: readonly { dest: string; content: string }[],
+  ): void {
+    const created: string[] = [];
     try {
-      fs.renameSync(tmp, localFile);
+      fs.mkdirSync(dir, { recursive: true });
+      for (const file of files) {
+        const tmp = `${file.dest}.${process.pid}.tmp`;
+        fs.writeFileSync(tmp, file.content, { encoding: 'utf-8', flag: 'wx' });
+        created.push(tmp);
+      }
+      for (let i = 0; i < files.length; i++) {
+        fs.renameSync(created[i], files[i].dest);
+      }
     } catch (e) {
-      try { fs.unlinkSync(tmp); } catch { /* best effort */ }
+      for (const tmp of created) {
+        try { fs.unlinkSync(tmp); } catch { /* best effort */ }
+      }
       throw e;
     }
   }
