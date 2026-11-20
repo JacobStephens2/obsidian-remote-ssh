@@ -21,6 +21,60 @@ function isNonEmptyArray(v: unknown): boolean {
 }
 
 /**
+ * A community-plugin id may be interpolated into a remote plugin path
+ * and joined onto the local plugins directory. Keep it only when it is
+ * one path segment: non-empty, not `.` or `..`, and containing no
+ * directory separator (`/` or `\`, either of which is a separator on
+ * at least one platform).
+ */
+function isSinglePathSegmentPluginId(id: string): boolean {
+  return id !== '' && id !== '.' && id !== '..' && !id.includes('/') && !id.includes('\\');
+}
+
+/**
+ * Absolute path `rel` may be created at under the local plugins
+ * directory, or null when that write would leave it.
+ *
+ * Same resolved-path confinement as `SftpDataAdapter.writeThroughConfig`:
+ * `path.resolve` decides containment (a string prefix would admit a
+ * sibling such as `plugins-evil`, and `..` walks out). A symlink at
+ * the destination is refused, because `writeFile` follows it. A
+ * symlinked ancestor is judged by realpath: one that stays inside the
+ * plugins directory is still that directory; one that doesn't is a
+ * refusal. A plugins directory that does not exist yet has no symlink
+ * to follow, so a lexically contained path is allowed.
+ */
+function containedPluginCodePath(pluginsRoot: string, rel: string): string | null {
+  const root = path.resolve(pluginsRoot);
+  let abs: string;
+  try {
+    abs = path.resolve(root, rel);
+  } catch {
+    return null;
+  }
+  if (abs === root || !abs.startsWith(root + path.sep)) return null;
+
+  try {
+    if (fs.lstatSync(abs, { throwIfNoEntry: false })?.isSymbolicLink()) return null;
+
+    let cursor = path.dirname(abs);
+    while (cursor !== root) {
+      if (fs.lstatSync(cursor, { throwIfNoEntry: false })) break;
+      const parent = path.dirname(cursor);
+      if (parent === cursor) return null;
+      cursor = parent;
+    }
+    if (!fs.existsSync(cursor)) return abs;
+    const realAncestor = fs.realpathSync(cursor);
+    const realRoot = fs.existsSync(root) ? fs.realpathSync(root) : root;
+    if (realAncestor !== realRoot && !realAncestor.startsWith(realRoot + path.sep)) return null;
+  } catch {
+    return null;
+  }
+  return abs;
+}
+
+/**
  * Narrow an unknown `secrets` (or `hostKeyStore`) blob to a plain
  * string-keyed record, defaulting to `{}` for anything that isn't a
  * non-array object. Keeps the #399 secret-merge below total even when a
@@ -887,9 +941,26 @@ export class ShadowVaultBootstrap {
     pluginIds: readonly string[],
   ): Promise<{ pulled: string[] }> {
     const pulled: string[] = [];
+    const pluginsRoot = path.join(localConfigDir, 'plugins');
     for (const id of pluginIds) {
       if (id === ShadowVaultBootstrap.SELF_PLUGIN_ID) continue;
-      const localPluginDir = path.join(localConfigDir, 'plugins', id);
+      // Parsed lists already drop these. A caller that passes a raw id
+      // must still not interpolate it into the remote plugin path.
+      if (!isSinglePathSegmentPluginId(id)) {
+        logger.warn(`pullPluginBinaries: ${id} skipped (not a single path segment)`);
+        continue;
+      }
+      const localPluginDir = containedPluginCodePath(pluginsRoot, id);
+      // Before mkdir or writeFile: the plugin directory and every code
+      // file must stay inside the local plugins directory.
+      if (
+        localPluginDir === null ||
+        ShadowVaultBootstrap.PLUGIN_BINARY_FILES.some((file) =>
+          containedPluginCodePath(pluginsRoot, path.join(id, file)) === null)
+      ) {
+        logger.warn(`pullPluginBinaries: ${id} skipped (outside the local plugins directory)`);
+        continue;
+      }
       const remoteManifest = `${remoteConfigDir}/plugins/${id}/manifest.json`;
       try {
         if (!(await reader.exists(remoteManifest))) continue; // no code on the remote
@@ -901,13 +972,27 @@ export class ShadowVaultBootstrap {
         // Skip unless absent locally, or the remote is strictly newer.
         if (localVer !== null && !ShadowVaultBootstrap.versionGt(remoteVer, localVer)) continue;
         let staged = false;
+        let blocked = false;
         for (const file of ShadowVaultBootstrap.PLUGIN_BINARY_FILES) {
           const remoteRel = `${remoteConfigDir}/plugins/${id}/${file}`;
           if (!(await reader.exists(remoteRel))) continue;
           const content = await reader.read(remoteRel);
-          fs.mkdirSync(localPluginDir, { recursive: true });
-          ShadowVaultBootstrap.writeFileAtomic(path.join(localPluginDir, file), content);
+          // Resolve again immediately before mkdir/write. The earlier
+          // check ran before the remote read, and a symlink can appear
+          // in that gap.
+          const dest = containedPluginCodePath(pluginsRoot, path.join(id, file));
+          const dirNow = containedPluginCodePath(pluginsRoot, id);
+          if (dest === null || dirNow === null) {
+            blocked = true;
+            break;
+          }
+          fs.mkdirSync(dirNow, { recursive: true });
+          ShadowVaultBootstrap.writeFileAtomic(dest, content);
           staged = true;
+        }
+        if (blocked) {
+          logger.warn(`pullPluginBinaries: ${id} skipped (outside the local plugins directory)`);
+          continue;
         }
         if (staged) pulled.push(id);
       } catch (e) {
@@ -998,12 +1083,18 @@ export class ShadowVaultBootstrap {
     }
   }
 
-  /** Parse a community-plugins.json body into a string-id array, or null if malformed. */
+  /**
+   * Parse a community-plugins.json body into a string-id array, or null
+   * if malformed. Ids that are not a single path segment are dropped
+   * here, so a later pull does not interpolate them into a remote
+   * plugin path.
+   */
   private static parsePluginIdList(content: string): string[] | null {
     try {
       const parsed: unknown = JSON.parse(content);
       if (!Array.isArray(parsed)) return null;
-      return (parsed as unknown[]).filter((s): s is string => typeof s === 'string');
+      return (parsed as unknown[]).filter((s): s is string =>
+        typeof s === 'string' && isSinglePathSegmentPluginId(s));
     } catch {
       return null;
     }

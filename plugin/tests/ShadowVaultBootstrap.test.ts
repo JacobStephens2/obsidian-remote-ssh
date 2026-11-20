@@ -1163,6 +1163,23 @@ describe('ShadowVaultBootstrap community-plugins round-trip (#429 / #342)', () =
     );
   });
 
+  it('drops enabled-plugin ids that are not a single path segment, so they are not kept for a plugin-path pull', async () => {
+    const localConfigDir = makeLocalConfigDir(['remote-ssh', 'nested/id']);
+    const remote: Record<string, string> = {
+      '.obsidian/community-plugins.json': JSON.stringify(['dataview', '', '.', '..', '../escaped', 'win\\id']),
+    };
+    const reader: SharedConfigReader = {
+      exists: (p) => Promise.resolve(p in remote),
+      read: (p) => Promise.resolve(remote[p]),
+    };
+
+    const { merged } = await ShadowVaultBootstrap.pullCommunityPlugins(reader, '.obsidian', localConfigDir);
+
+    expect(merged).toEqual(['remote-ssh', 'dataview']);
+    expect(readLocal(localConfigDir)).toEqual(['remote-ssh', 'dataview']);
+    expect(ShadowVaultBootstrap.readEnabledPluginIds(localConfigDir)).toEqual(['remote-ssh', 'dataview']);
+  });
+
   // Reader+writer fake backed by an in-memory store. `read` can be made
   // to throw to simulate a transient SSH error mid-read.
   function makeRemoteRW(initial?: string[], readThrows = false): {
@@ -1666,6 +1683,106 @@ describe('ShadowVaultBootstrap plugin-binary round-trip (#429b — BRAT / non-ma
 
     expect(pulled, 'good pulls even though bad errored').toContain('good');
     expect(pulled).not.toContain('bad');
+  });
+
+  it('does not write plugin code outside the local plugins directory', async () => {
+    const cfg = makeLocalConfigDir();
+    const pluginsDir = path.join(cfg, 'plugins');
+    const escapedName = `escaped-${process.pid}`;
+    const parentEscape = `../../${escapedName}`;
+    const siblingEscape = '../plugins-evil';
+    const parentVictim = path.resolve(cfg, '..', escapedName, 'main.js');
+    const siblingVictim = path.join(cfg, 'plugins-evil', 'main.js');
+    const seen: string[] = [];
+    const { rw } = makeRW({
+      [`.obsidian/plugins/${parentEscape}/manifest.json`]: manifest('x', '1.0.0'),
+      [`.obsidian/plugins/${parentEscape}/main.js`]: '/* escaped */\n',
+      [`.obsidian/plugins/${siblingEscape}/manifest.json`]: manifest('y', '1.0.0'),
+      [`.obsidian/plugins/${siblingEscape}/main.js`]: '/* sibling */\n',
+      '.obsidian/plugins/brat-x/manifest.json': manifest('brat-x', '1.0.0'),
+      '.obsidian/plugins/brat-x/main.js': '/* brat code */\n',
+    });
+    const exists = rw.exists.bind(rw);
+    const read = rw.read.bind(rw);
+    rw.exists = (p) => { seen.push(p); return exists(p); };
+    rw.read = (p) => { seen.push(p); return read(p); };
+
+    const { pulled } = await ShadowVaultBootstrap.pullPluginBinaries(
+      rw, '.obsidian', cfg, [parentEscape, siblingEscape, 'brat-x'],
+    );
+
+    expect(pulled).not.toContain(parentEscape);
+    expect(pulled).not.toContain(siblingEscape);
+    expect(seen.some((p) => p.includes('..') || p.includes('plugins-evil'))).toBe(false);
+    expect(fs.existsSync(parentVictim), 'a .. id must not write outside the plugins directory').toBe(false);
+    expect(fs.existsSync(siblingVictim), 'a sibling of the plugins directory must not be written').toBe(false);
+    expect(fs.existsSync(path.join(pluginsDir, escapedName)), 'the escaped id must not be created under plugins').toBe(false);
+    expect(pulled).toContain('brat-x');
+    expect(fs.readFileSync(pluginFile(cfg, 'brat-x', 'main.js'), 'utf-8')).toBe('/* brat code */\n');
+  });
+
+  it('does not follow a plugin-directory symlink out of the local plugins directory', async () => {
+    const cfg = makeLocalConfigDir();
+    const pluginsDir = path.join(cfg, 'plugins');
+    fs.mkdirSync(pluginsDir, { recursive: true });
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'plugin-pull-outside-'));
+    const outsideMain = path.join(outside, 'main.js');
+    fs.writeFileSync(outsideMain, 'keep', 'utf-8');
+    const link = path.join(pluginsDir, 'evil');
+    try {
+      fs.symlinkSync(outside, link, 'dir');
+    } catch (e) {
+      console.warn(`skipping: cannot create symlink in test env: ${(e as Error).message}`);
+      return;
+    }
+    const { rw } = makeRW({
+      '.obsidian/plugins/evil/manifest.json': manifest('evil', '1.0.0'),
+      '.obsidian/plugins/evil/main.js': '/* pwned */\n',
+    });
+
+    const { pulled } = await ShadowVaultBootstrap.pullPluginBinaries(rw, '.obsidian', cfg, ['evil']);
+
+    expect(pulled).not.toContain('evil');
+    expect(fs.readFileSync(outsideMain, 'utf-8'), 'pull must not write through a symlinked plugin dir').toBe('keep');
+    expect(fs.lstatSync(link).isSymbolicLink()).toBe(true);
+  });
+
+  it('does not follow a plugin-file symlink out of the local plugins directory', async () => {
+    const cfg = makeLocalConfigDir();
+    const pluginDir = path.join(cfg, 'plugins', 'evil');
+    fs.mkdirSync(pluginDir, { recursive: true });
+    fs.writeFileSync(path.join(pluginDir, 'manifest.json'), manifest('evil', '1.0.0'), 'utf-8');
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'plugin-pull-file-'));
+    const outsideMain = path.join(outside, 'main.js');
+    fs.writeFileSync(outsideMain, 'keep', 'utf-8');
+    const link = path.join(pluginDir, 'main.js');
+    try {
+      fs.symlinkSync(outsideMain, link);
+    } catch (e) {
+      console.warn(`skipping: cannot create symlink in test env: ${(e as Error).message}`);
+      return;
+    }
+    const { rw } = makeRW({
+      '.obsidian/plugins/evil/manifest.json': manifest('evil', '2.0.0'),
+      '.obsidian/plugins/evil/main.js': '/* pwned */\n',
+    });
+
+    const { pulled } = await ShadowVaultBootstrap.pullPluginBinaries(rw, '.obsidian', cfg, ['evil']);
+
+    expect(pulled).not.toContain('evil');
+    expect(fs.readFileSync(outsideMain, 'utf-8'), 'pull must not overwrite a symlinked code file').toBe('keep');
+    expect(fs.lstatSync(link).isSymbolicLink()).toBe(true);
+  });
+
+  it('keeps only a single path segment when the enabled-plugin list is parsed', () => {
+    const cfg = makeLocalConfigDir();
+    fs.writeFileSync(
+      path.join(cfg, 'community-plugins.json'),
+      JSON.stringify(['dataview', '', '.', '..', 'nested/id', 'win\\id', 'templater-obsidian']),
+      'utf-8',
+    );
+
+    expect(ShadowVaultBootstrap.readEnabledPluginIds(cfg)).toEqual(['dataview', 'templater-obsidian']);
   });
 });
 
