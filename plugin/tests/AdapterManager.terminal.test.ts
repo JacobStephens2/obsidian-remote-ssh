@@ -2,7 +2,11 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 vi.mock('../src/ui/RemoteTerminalView', () => ({
   RemoteTerminalView: class {}, VIEW_TYPE_REMOTE_TERMINAL: 'remote-terminal',
 }));
-import { App, clearNotices, recordedNotices } from 'obsidian';
+import { App, clearNotices, recordedNotices, type ListedFiles } from 'obsidian';
+import type { RemoteFsClient } from '../src/adapter/RemoteFsClient';
+import { SftpDataAdapter } from '../src/adapter/SftpDataAdapter';
+import { DirCache } from '../src/cache/DirCache';
+import { ReadCache } from '../src/cache/ReadCache';
 import type { ConnectionManager } from '../src/ConnectionManager';
 import RemoteSshPlugin from '../src/main';
 import { ShadowStartupCoordinator } from '../src/shadow/ShadowStartupCoordinator';
@@ -35,17 +39,22 @@ function harness() {
   const profile = { id: 'p', name: 'Test', walkIgnoreDirs: [] };
   const settings = { profiles: [profile], autoConnectProfileId: 'p', activeProfileId: null, reconnectMaxRetries: 0 };
   p.settings = settings;
-  const conn = { activeProfile: profile, reconnectManager: { isActive: () => true }, rpcConnection: null,
+  const conn = { activeProfile: profile, reconnectManager: { isActive: () => true },
+    activeRemoteBasePath: '/vault', rpcConnection: null,
     cancelReconnect: vi.fn(), startReconnect, disconnectTransport: vi.fn(async () => {}),
     isAlive: () => false };
   p.conn = conn;
-  p.adapterMgr = { restore, isPatched: () => true, dataAdapter: { setReconnecting, list }, replayOfflineQueue };
-  p.statusBar = { remove: vi.fn() };
+  const adapterMgr = {
+    restore, isPatched: () => true, replayOfflineQueue,
+    dataAdapter: { setReconnecting, list } as Partial<SftpDataAdapter> | null,
+  };
+  p.adapterMgr = adapterMgr;
+  p.statusBar = { remove: vi.fn(), update: vi.fn() };
   p.population = { stop, pause, resume };
   p.state = SyncState.IDLE;
   p.setState = vi.fn((state) => { p.state = state; });
   plugin.app.workspace.detachLeavesOfType = vi.fn();
-  return { plugin, p, settings, conn, restore, stop, pause, resume, startReconnect, list, setReconnecting, replayOfflineQueue };
+  return { plugin, p, settings, conn, adapterMgr, restore, stop, pause, resume, startReconnect, list, setReconnecting, replayOfflineQueue };
 }
 
 afterEach(() => { vi.restoreAllMocks(); clearNotices(); });
@@ -119,6 +128,26 @@ describe('plugin terminal adapter lifetimes', () => {
     expect(recordedNotices()).toEqual(['Remote SSH: adapter restored']);
   });
 
+  it('suppresses Ready when the initial listing settles after a terminal restore', async () => {
+    const h = harness();
+    h.conn.reconnectManager.isActive = () => false;
+    Object.assign(h.plugin.app.vault, { adapter: {} });
+    let settle!: (files: ListedFiles) => void;
+    h.list.mockReturnValue(new Promise<ListedFiles>(resolve => { settle = resolve; }));
+    Object.assign(h.adapterMgr.dataAdapter!, { isReconnecting: () => false });
+    vi.spyOn(h.plugin, 'connectProfile').mockImplementation(() => {
+      h.p.setState(SyncState.CONNECTED);
+      return Promise.resolve();
+    });
+
+    const startup = h.p.runAutoConnect('reconnect');
+    await vi.waitFor(() => expect(h.list).toHaveBeenCalledOnce());
+    h.p.debugRestoreAdapter();
+    await startup;
+    settle({ files: [], folders: [] });
+    expect(recordedNotices()).toEqual(['Remote SSH: adapter restored']);
+  });
+
   it('pauses before starting retries and resumes after the same adapter is unblocked', async () => {
     const h = harness();
     h.settings.reconnectMaxRetries = 3;
@@ -146,5 +175,54 @@ describe('plugin terminal adapter lifetimes', () => {
     expect(h.resume).not.toHaveBeenCalled();
     expect(h.replayOfflineQueue).not.toHaveBeenCalled();
     expect(recordedNotices()).toEqual(['Remote SSH: reconnect cancelled']);
+  });
+
+  it('uses the profile root when the same RPC adapter resumes over SFTP', async () => {
+    const h = harness();
+    h.settings.reconnectMaxRetries = 3;
+    const list = vi.fn().mockResolvedValue([]);
+    const client = { list } as unknown as RemoteFsClient;
+    h.adapterMgr.dataAdapter = new SftpDataAdapter({} as RemoteFsClient, '', new ReadCache(), new DirCache(), 'vault');
+    h.resume.mockImplementation(({ adapter }) => adapter.list('notes'));
+
+    await h.p.startReconnect();
+    const [retry] = h.startReconnect.mock.calls[0];
+    retry.setAdapterReconnecting(true);
+    retry.hooks.swapClient(client);
+    retry.onState({ kind: 'recovered' });
+    await h.resume.mock.results[0].value;
+    expect(list).toHaveBeenCalledWith('/vault/notes');
+  });
+
+  it('rebinds an adapter installed during an automatic retry', async () => {
+    const h = harness();
+    h.settings.reconnectMaxRetries = 3;
+    const adapter = { setReconnecting: vi.fn(), swapClient: vi.fn(), list: vi.fn() };
+    h.adapterMgr.dataAdapter = null;
+    await h.p.startReconnect();
+    const [retry] = h.startReconnect.mock.calls[0];
+    retry.setAdapterReconnecting(true);
+    h.adapterMgr.dataAdapter = adapter;
+    const client = {} as RemoteFsClient;
+    retry.hooks.swapClient(client);
+    retry.onState({ kind: 'recovered' });
+
+    expect(adapter.swapClient).toHaveBeenCalledWith(client, '/vault');
+    expect(adapter.setReconnecting.mock.calls).toEqual([[true], [false]]);
+    expect(adapter.swapClient).toHaveBeenCalledBefore(h.resume);
+    expect(h.p.state).toBe(SyncState.CONNECTED);
+  });
+
+  it('surfaces exhausted retries after the adapter is manually restored', async () => {
+    const h = harness();
+    h.settings.reconnectMaxRetries = 3;
+    h.restore.mockImplementation(() => { h.adapterMgr.dataAdapter = null; });
+    await h.p.startReconnect();
+    const [retry] = h.startReconnect.mock.calls[0];
+    h.p.debugRestoreAdapter();
+    retry.onState({ kind: 'failed', reason: 'connection lost' });
+
+    expect(h.p.state).toBe(SyncState.ERROR);
+    expect(h.resume).not.toHaveBeenCalled();
   });
 });

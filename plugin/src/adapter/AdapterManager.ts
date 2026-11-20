@@ -157,12 +157,6 @@ export class AdapterManager {
     const ignoreDirs = [...(profile?.walkIgnoreDirs ?? DEFAULT_WALK_IGNORE_DIRS)];
     this.readCache = new ReadCache();
     this.dirCache = new DirCache();
-    // Pick the transport that matches the active session: when an
-    // RPC tunnel is up, route everything through the daemon; otherwise
-    // fall back to the direct-SFTP wrapper. The adapter itself is
-    // unaware of the choice — both clients implement RemoteFsClient.
-    const fsClient = this.conn.buildFsClient();
-    const transportLabel = this.conn.rpcConnection ? 'RPC' : 'SFTP';
     // Per-client path remapping: client-private files like
     // .obsidian/workspace.json get redirected into a per-client subtree
     // on the remote so two machines on the same vault don't trample
@@ -209,16 +203,6 @@ export class AdapterManager {
       this.resourceBridge = null;
     }
 
-    // The Go daemon already knows the absolute vault root via its
-    // `--vault-root` flag, so RPC clients must send paths RELATIVE to
-    // that root (empty string for the root itself). Sending the same
-    // `work/VaultDev` prefix the SFTP path needs would double up:
-    // daemon-side `Resolve(absRoot, "work/VaultDev")` becomes
-    // `<absRoot>/work/VaultDev`, missing the real vault entirely
-    // (or — when a stale doubled mirror exists — quietly listing it).
-    // The SFTP transport has no such root-knowing server; it does need
-    // the prefix to anchor calls at the vault.
-    const adapterRemoteBase = this.conn.rpcConnection ? '' : this.conn.activeRemoteBasePath;
     // Per-session ancestor snapshot store. Powers the 3-way merge UI;
     // cleared on disconnect with the rest of the patched-adapter state.
     this.ancestorTracker = new AncestorTracker();
@@ -250,6 +234,12 @@ export class AdapterManager {
       }
     }
     if (!lifetime.active) return false;
+    // A reconnect can finish while the bridge or queue opens. Capture its
+    // client and path together at install time. The daemon owns its vault root,
+    // while SFTP needs the profile's root prefixed onto vault-relative paths.
+    const fsClient = this.conn.buildFsClient();
+    const transportLabel = this.conn.rpcConnection ? 'RPC' : 'SFTP';
+    const adapterRemoteBase = this.conn.rpcConnection ? '' : this.conn.activeRemoteBasePath;
     const conflictResolver = new ConflictResolver(
       fsClient,
       this.readCache,

@@ -285,11 +285,13 @@ export class SftpDataAdapter {
    * fresh client (RPC tunnel or SFTP) without going through a
    * restore/re-patch cycle that would force editors to re-render.
    *
-   * Caches are preserved — entries are mtime-keyed, so any divergence
-   * is caught on the next read.
+   * File content is revalidated by mtime. Listings are discarded because
+   * a resumed population needs the new transport's tree immediately.
    */
-  swapClient(newClient: RemoteFsClient): void {
+  swapClient(newClient: RemoteFsClient, remoteBasePath = this.remoteBasePath): void {
     this.client = newClient;
+    this.remoteBasePath = remoteBasePath;
+    this.dirCache.clear();
     this.conflictResolver?.swapClient(newClient);
   }
 

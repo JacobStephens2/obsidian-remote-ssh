@@ -1,5 +1,9 @@
 import type { ListedFiles, Vault } from 'obsidian';
 import { describe, expect, it, vi } from 'vitest';
+import type { RemoteFsClient } from '../src/adapter/RemoteFsClient';
+import { SftpDataAdapter } from '../src/adapter/SftpDataAdapter';
+import { DirCache } from '../src/cache/DirCache';
+import { ReadCache } from '../src/cache/ReadCache';
 import type { WalkParams, WalkResult } from '../src/proto/types';
 import { VaultModelBuilder, type ObsidianClassDeps } from '../src/vault/VaultModelBuilder';
 import { VaultPopulation, type PopulationProgress } from '../src/vault/VaultPopulation';
@@ -177,6 +181,27 @@ describe('Vault population', () => {
     chunk.resolve();
     await expect(result).resolves.toMatchObject({ kind: 'complete' });
     expect(h.pathsCreated()).toEqual(['a', 'a/first.md', 'a/new.md']);
+  });
+
+  it('reads the rebound SFTP tree after pausing a partially built cached listing', async () => {
+    const chunk = deferred<void>();
+    const h = harness(false, { chunk: () => chunk.promise });
+    const old = { list: vi.fn().mockResolvedValue([{ name: 'a.md' }, { name: 'b.md' }, { name: 'old.md' }]) };
+    const rebound = { list: vi.fn().mockResolvedValue([{ name: 'a.md' }, { name: 'b.md' }, { name: 'new.md' }]) };
+    const adapter = new SftpDataAdapter(
+      old as unknown as RemoteFsClient, '/vault', new ReadCache(), new DirCache({ now: () => 0 }), 'v',
+    );
+    h.population.resume({ adapter });
+    const startup = h.population.populate('cache');
+    await vi.waitFor(() => expect(h.pathsCreated()).toEqual(['a.md', 'b.md']));
+
+    h.population.pause();
+    adapter.swapClient(rebound as unknown as RemoteFsClient);
+    h.population.resume({ adapter });
+    chunk.resolve();
+    await expect(startup).resolves.toMatchObject({ kind: 'complete' });
+    expect(h.pathsCreated()).toEqual(['a.md', 'b.md', 'new.md']);
+    expect(rebound.list).toHaveBeenCalledWith('/vault');
   });
 
   it('discards a paused background chunk and finishes through the rebound generation', async () => {

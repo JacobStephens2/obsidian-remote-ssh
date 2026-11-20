@@ -318,10 +318,11 @@ export default class RemoteSshPlugin extends Plugin {
     // Done inside `onLayoutReady` so we wait for Obsidian's own
     // vault initialization to finish before touching plugins or the
     // adapter.
+    if (this.settings.autoConnectProfileId) this.installExpandHook();
+    const layoutRevision = this.startupRevision;
     this.app.workspace.onLayoutReady(() => {
       if (this.settings.autoConnectProfileId) {
-        this.installExpandHook();
-        void this.runShadowStartup();
+        if (layoutRevision === this.startupRevision) void this.runShadowStartup();
         return;
       }
       // F17 — first-launch onboarding. Opens the wizard when the user
@@ -534,7 +535,7 @@ export default class RemoteSshPlugin extends Plugin {
     }
 
     if (attempt !== this.startupRevision) return;
-    this.setState(SyncState.CONNECTED);
+    if (!this.reconnectRun) this.setState(SyncState.CONNECTED);
     this.settings.activeProfileId = profile.id;
     await this.saveSettings();
     if (attempt !== this.startupRevision) return;
@@ -775,7 +776,7 @@ export default class RemoteSshPlugin extends Plugin {
       },
     });
     this.population = population;
-    if (!da.isReconnecting()) this.resumePopulation(da);
+    if (this.state === SyncState.CONNECTED && !da.isReconnecting()) this.resumePopulation(da);
     try {
       const result = await population.populate(`shadow-${tag}`);
       if (!isCurrent() || result.kind === 'cancelled' || this.state !== SyncState.CONNECTED) return;
@@ -803,6 +804,7 @@ export default class RemoteSshPlugin extends Plugin {
 
   private cancelReconnect(): void {
     if (!this.conn.reconnectManager?.isActive()) return;
+    this.reconnectRun = null;
     this.restoreAdapter();
     this.conn.cancelReconnect();
     this.setState(SyncState.ERROR);
@@ -810,6 +812,7 @@ export default class RemoteSshPlugin extends Plugin {
   }
 
   private async startReconnect(): Promise<void> {
+    if (this.reconnectRun) return;
     this.population?.pause();
     if (!this.conn.activeProfile) {
       logger.warn('startReconnect: no active profile to reconnect with');
@@ -824,21 +827,35 @@ export default class RemoteSshPlugin extends Plugin {
       this.setState(SyncState.ERROR);
       return;
     }
-    if (this.reconnectRun) return;
-    const run = {};
+    const run = { adapter: this.adapterMgr.dataAdapter };
     this.reconnectRun = run;
-    const da = this.adapterMgr.dataAdapter;
-    const isCurrent = () => this.reconnectRun === run && this.adapterMgr.dataAdapter === da;
+    const currentAdapter = () => {
+      if (this.reconnectRun !== run) return null;
+      // Initial patching may still be waiting on the bridge or offline queue.
+      const installed = this.adapterMgr.dataAdapter;
+      run.adapter ??= installed;
+      return run.adapter === installed ? installed : null;
+    };
     this.setState(SyncState.RECONNECTING);
     await this.conn.startReconnect({
       maxRetries,
-      setAdapterReconnecting: (on) => { if (isCurrent()) da?.setReconnecting(on); },
-      onState: (s) => { if (isCurrent()) this.onReconnectStateChange(s); },
+      setAdapterReconnecting: (on) => currentAdapter()?.setReconnecting(on),
+      onState: (s) => {
+        if (this.reconnectRun === run) this.onReconnectStateChange(s, currentAdapter());
+      },
       hooks: {
-        swapClient: (c) => { if (isCurrent()) da?.swapClient(c); },
-        prepareListenerForReconnect: () => { if (isCurrent()) this.fsChangeListener.prepareForReconnect(); },
+        swapClient: (client) => {
+          const da = currentAdapter();
+          if (!da) return;
+          da.setReconnecting(true);
+          da.swapClient(client, this.conn.rpcConnection ? '' : this.conn.activeRemoteBasePath ?? undefined);
+        },
+        prepareListenerForReconnect: () => {
+          if (this.reconnectRun === run) this.fsChangeListener.prepareForReconnect();
+        },
         resumeListenerAfterReconnect: async (rpc) => {
-          if (da && isCurrent()) {
+          const da = currentAdapter();
+          if (da) {
             await this.fsChangeListener.resumeAfterReconnect({
               rpcConnection: rpc,
               dataAdapter: da,
@@ -853,7 +870,7 @@ export default class RemoteSshPlugin extends Plugin {
    * Project the manager's state onto the StatusBar + Notice surface
    * and, on terminal states, clean up.
    */
-  private onReconnectStateChange(s: ReconnectState): void {
+  private onReconnectStateChange(s: ReconnectState, da = this.adapterMgr.dataAdapter): void {
     // F22 — opt-in telemetry. No-op when disabled.
     telemetry.recordReconnect(s.kind);
     if (s.kind === 'waiting') {
@@ -868,7 +885,6 @@ export default class RemoteSshPlugin extends Plugin {
         `Remote SSH: Reconnecting (attempt ${s.attempt}/${s.totalAttempts})…`,
       );
     } else if (s.kind === 'recovered') {
-      const da = this.adapterMgr.dataAdapter;
       da?.setReconnecting(false);
       this.setState(SyncState.CONNECTED);
       if (da) this.resumePopulation(da);
@@ -879,12 +895,13 @@ export default class RemoteSshPlugin extends Plugin {
       // forget: the user's already-back state is independent of the
       // replay outcome, and individual op failures stay in the queue
       // for the next reconnect.
-      void this.adapterMgr.replayOfflineQueue('after-reconnect');
+      if (da) void this.adapterMgr.replayOfflineQueue('after-reconnect');
     } else if (s.kind === 'failed') {
       // Give up: tear the patched adapter down so Obsidian falls
       // back to local file:// reads instead of blocking forever on a
       // dead transport. restore() clears dataAdapter so the
       // setReconnecting flag goes with it.
+      this.reconnectRun = null;
       this.restoreAdapter();
       this.setState(SyncState.ERROR);
       // s.reason is a string from ReconnectManager; wrap into Error
@@ -899,6 +916,7 @@ export default class RemoteSshPlugin extends Plugin {
       new Notice(notice);
       this.conn.reconnectManager = null;
     } else if (s.kind === 'cancelled') {
+      this.reconnectRun = null;
       this.restoreAdapter();
       this.conn.reconnectManager = null;
     }
@@ -914,6 +932,7 @@ export default class RemoteSshPlugin extends Plugin {
     const wasActive = this.state !== SyncState.IDLE
       || this.conn.isAlive()
       || this.settings.activeProfileId !== null;
+    this.reconnectRun = null;
     this.restoreAdapter();
     this.conn.cancelReconnect();
     if (this.disconnecting) return this.disconnecting;
@@ -987,7 +1006,6 @@ export default class RemoteSshPlugin extends Plugin {
   private restoreAdapter(): void {
     const hadPopulation = this.population !== null;
     this.stopPopulation();
-    this.reconnectRun = null;
     // The config watcher pushes through the adapter being restored.
     this.sharedConfigWatcher?.stop();
     this.sharedConfigWatcher = null;
