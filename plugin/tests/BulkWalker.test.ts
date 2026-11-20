@@ -288,6 +288,7 @@ describe('BulkWalker', () => {
 
     expect(result.source).toBe('fallback-list');
     expect(result.entries.map(e => e.path).sort()).toEqual(['broken', 'good', 'good/inside.md', 'ok.md']);
+    expect(result.failedListings).toEqual([{ path: 'broken', message: expect.any(String) }]);
     expect(listCalls).toBeGreaterThan(0);
   });
 

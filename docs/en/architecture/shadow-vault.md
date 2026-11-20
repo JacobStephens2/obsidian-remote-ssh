@@ -86,9 +86,9 @@ flowchart TD
       S1[Vault loads — empty dir, files = 0] --> S2[Remote SSH plugin onload]
       S2 --> S3{data.json has<br/>autoConnectProfileId?}
       S3 -->|yes| S4[Connect to remote profile]
-      S4 --> S5[Patch adapter to RpcRemoteFsClient]
-      S5 --> S6[VaultModelBuilder: walk remote vault →<br/>construct TFile / TFolder objects →<br/>insert into vault.fileMap + parent.children]
-      S6 --> S7[vault.trigger 'create' / 'folder-created' for each]
+      S4 --> S5[Patch adapter for RPC or SFTP]
+      S5 --> S6[Vault population: walk remote tree with BulkWalker →<br/>register entries with VaultModelBuilder]
+      S6 --> S7[VaultModelBuilder inserts into vault.fileMap and parent.children<br/>and fires create for each added entry]
       S7 --> S8[File Explorer renders remote tree.<br/>Templater / Dataview / etc see a normal vault]
     end
 
@@ -110,7 +110,8 @@ Red = open question / unverified mechanism (see §4).
 | `ShadowVaultManager` | shipped (PR #64) | High-level: given a profile, decide whether shadow vault already exists, bootstrap if not, then ask `WindowSpawner` to open it. |
 | `WindowSpawner` | shipped (PR #64) | Fires `obsidian://open?path=<vaultPath>` via `window.open`. Obsidian's URL handler accepts the path because `ObsidianRegistry` registered it (see OQ1). |
 | `ObsidianRegistry` | shipped (PR #64) | Reads/atomically rewrites `obsidian.json` (Obsidian's per-user vault list). Idempotent register; preserves unknown top-level keys; per-OS resolution via `os.homedir()` / env vars. |
-| `VaultModelBuilder` | shipped (PR #61, fixes #62/#63/#68; mutators in #70) | The single source of truth for vault-model writes. `build(entries)` for the bulk initial fill on connect; `insertOne` / `removeOne` / `modifyOne` / `renameOne` for incremental fs.watch-driven updates. Constructs `TFile` / `TFolder` via injected constructors (see OQ2). |
+| `VaultPopulation` | shipped | Owns initial registration, File Explorer expansion and background registration. Shares folder completion and pending loads within each transport generation. |
+| `VaultModelBuilder` | shipped (PR #61, fixes #62/#63/#68; mutators in #70) | The single source of truth for vault-model writes. `buildChunked` registers walked entries; `insertOne` / `removeOne` / `modifyOne` / `renameOne` apply incremental updates. Constructs `TFile` / `TFolder` via injected constructors (see OQ2). |
 | `RpcRemoteFsClient` | unchanged | Existing α (Go daemon) RPC transport. |
 | `SftpRemoteFsClient` | unchanged | Existing direct-SFTP fallback. |
 | `ServerDeployer` | unchanged | Auto-deploys the daemon (0.4.2 absolute paths + 0.4.3 suffix-pkill fixes both apply). |
@@ -343,10 +344,10 @@ command.
 
 `onLayoutReady` hook in `main.ts` reads `autoConnectProfileId` and
 runs `runAutoConnect`. The new shadow window self-connects, patches
-its own adapter, runs `populateVaultFromRemote`, and File Explorer
-fills with the remote tree without further user input. The
-`Reconnect` command lets the user retry from inside the shadow
-window after a transient connect failure.
+its own adapter, and starts Vault population. The same lifetime owns the
+initial load, folder expansion, and background registration. A lazy startup
+registers the root first and fills the remaining tree in the background.
+The `Reconnect` command uses the same startup path inside the shadow window.
 
 ### Phase 5 deliverable (shipped)
 

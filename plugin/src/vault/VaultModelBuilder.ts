@@ -131,16 +131,23 @@ export class VaultModelBuilder {
   async buildChunked(
     entries: ReadonlyArray<RemoteEntry>,
     chunkSize = 500,
+    signal?: AbortSignal,
+    yieldChunk = yieldToEventLoop,
   ): Promise<BuildResult> {
+    signal?.throwIfAborted();
     const result: BuildResult = {
       filesAdded: 0, foldersAdded: 0, skipped: 0, errors: [],
     };
     const ordered = [...entries].sort(byFoldersFirstThenDepth);
     for (let i = 0; i < ordered.length; i += chunkSize) {
       const end = Math.min(i + chunkSize, ordered.length);
-      for (let j = i; j < end; j++) this.insertBuildEntry(ordered[j], result);
-      if (end < ordered.length) await yieldToEventLoop();
+      for (let j = i; j < end; j++) {
+        signal?.throwIfAborted();
+        this.insertBuildEntry(ordered[j], result);
+      }
+      if (end < ordered.length) await yieldChunk();
     }
+    signal?.throwIfAborted();
     logger.info(
       `VaultModelBuilder: built ${result.filesAdded}f + ${result.foldersAdded}d (chunked), ` +
       `${result.skipped} skipped, ${result.errors.length} errors`,

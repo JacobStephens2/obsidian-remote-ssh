@@ -11,6 +11,7 @@ import { HostKeyMismatchModal } from './ui/HostKeyMismatchModal';
 import { PendingEditsBar } from './ui/PendingEditsBar';
 import { RpcRemoteFsClient } from './adapter/RpcRemoteFsClient';
 import { AdapterManager } from './adapter/AdapterManager';
+import type { SftpDataAdapter } from './adapter/SftpDataAdapter';
 import { establishRpcConnection } from './transport/RpcConnection';
 import { ServerDeployer } from './transport/ServerDeployer';
 import type { ReconnectState } from './transport/ReconnectManager';
@@ -23,9 +24,7 @@ import { logger } from './util/logger';
 import { classifyToNotice } from './transport/errorTaxonomy';
 import { VaultModelBuilder } from './vault/VaultModelBuilder';
 import { FsChangeListener } from './vault/FsChangeListener';
-import { BulkWalker } from './vault/BulkWalker';
-import { LazyFolderLoader } from './vault/LazyFolderLoader';
-import { BackgroundIndexer, type IndexProgress } from './vault/BackgroundIndexer';
+import { VaultPopulation, type PopulationProgress } from './vault/VaultPopulation';
 import { RenameLeafFollower } from './vault/RenameLeafFollower';
 import { ObsidianRegistry } from './shadow/ObsidianRegistry';
 import { ShadowVaultBootstrap } from './shadow/ShadowVaultBootstrap';
@@ -319,9 +318,11 @@ export default class RemoteSshPlugin extends Plugin {
     // Done inside `onLayoutReady` so we wait for Obsidian's own
     // vault initialization to finish before touching plugins or the
     // adapter.
+    if (this.settings.autoConnectProfileId) this.installExpandHook();
+    const layoutRevision = this.startupRevision;
     this.app.workspace.onLayoutReady(() => {
       if (this.settings.autoConnectProfileId) {
-        void this.runShadowStartup();
+        if (layoutRevision === this.startupRevision) void this.runShadowStartup();
         return;
       }
       // F17 — first-launch onboarding. Opens the wizard when the user
@@ -364,17 +365,16 @@ export default class RemoteSshPlugin extends Plugin {
    * connect half without re-fetching anything.
    */
   private async runShadowStartup(): Promise<void> {
+    const attempt = this.stopPopulation();
     const coordinator = new ShadowStartupCoordinator(
       this.app, this.settings, () => this.saveSettings(),
     );
     await coordinator.prepareForAutoConnect();
-    await this.runAutoConnect('layout-ready');
+    if (attempt === this.startupRevision) await this.runAutoConnect('layout-ready', attempt);
   }
 
   onunload() {
-    // Restore adapter first so any in-flight Obsidian read calls see the
-    // original FileSystemAdapter again before we tear down the SSH session.
-    this.adapterMgr.restore();
+    // disconnect restores the adapter synchronously before transport teardown.
     void this.disconnect().catch(() => { /* ignore */ });
     this.statusBar?.remove();
     this.pendingEditsBar?.remove();
@@ -461,7 +461,7 @@ export default class RemoteSshPlugin extends Plugin {
     });
   }
 
-  async connectProfile(profile: SshProfile) {
+  async connectProfile(profile: SshProfile, attempt = this.startupRevision) {
     if (this.conn.isAlive()) {
       new Notice('Remote SSH: already connected. Disconnect first.');
       return;
@@ -470,6 +470,7 @@ export default class RemoteSshPlugin extends Plugin {
     try {
       await this.conn.connectSsh(profile);
     } catch (e) {
+      if (attempt !== this.startupRevision) return;
       this.setState(SyncState.ERROR);
       const { notice, classified } = classifyToNotice(e);
       logger.error(`Connect failed: ${classified.title}`, {
@@ -480,6 +481,7 @@ export default class RemoteSshPlugin extends Plugin {
       try { await this.conn.client.disconnect(); } catch { /* ignore */ }
       return;
     }
+    if (attempt !== this.startupRevision) return;
 
     let transport = profile.transport ?? 'sftp';
     let rpcSummary = '';
@@ -490,6 +492,7 @@ export default class RemoteSshPlugin extends Plugin {
         const ver  = this.conn.rpcConnection?.info.version ?? '?';
         rpcSummary = ` — daemon ${ver}, ${caps} capabilities`;
       } catch (e) {
+        if (attempt !== this.startupRevision) return;
         // The daemon is an optimization layer, not a requirement. Most
         // failures to bring it up degrade to SFTP rather than failing the
         // whole connect — a hard failure skips populate and strands the user
@@ -531,14 +534,17 @@ export default class RemoteSshPlugin extends Plugin {
       }
     }
 
-    this.setState(SyncState.CONNECTED);
+    if (attempt !== this.startupRevision) return;
+    if (!this.reconnectRun) this.setState(SyncState.CONNECTED);
     this.settings.activeProfileId = profile.id;
     await this.saveSettings();
+    if (attempt !== this.startupRevision) return;
 
     const patched = await this.adapterMgr.patch();
+    if (attempt !== this.startupRevision) return;
     if (!patched) {
       new Notice('Remote SSH: adapter patch failed — disconnecting');
-      await this.disconnect().catch(() => { /* already errored */ });
+      void this.disconnect().catch(() => { /* already errored */ });
       return;
     }
 
@@ -552,13 +558,15 @@ export default class RemoteSshPlugin extends Plugin {
   /**
    * Phase 4 entry point: connect to the profile pointed at by
    * `settings.autoConnectProfileId`, then populate the empty shadow
-   * vault from the remote tree via `VaultModelBuilder`. Called once
+   * vault from the remote tree via `VaultPopulation`. Called once
    * on `onLayoutReady` and again from the `Reconnect` command.
    *
    * `tag` shows up in the log line so we can tell whether a given
    * run came from the layout-ready hook or a manual reconnect.
    */
-  private async runAutoConnect(tag: 'layout-ready' | 'reconnect'): Promise<void> {
+  private async runAutoConnect(
+    tag: 'layout-ready' | 'reconnect', attempt = this.stopPopulation(),
+  ): Promise<void> {
     const profileId = this.settings.autoConnectProfileId;
     if (!profileId) return;
     const profile = this.settings.profiles.find(p => p.id === profileId);
@@ -574,15 +582,33 @@ export default class RemoteSshPlugin extends Plugin {
       return;
     }
 
-    if (this.conn.client.isAlive()) {
+    // Connection setup uses the shared ConnectionManager. Let superseded
+    // setup finish before a replacement can reuse or tear down its transport.
+    if (this.connecting) await this.connecting.catch(() => {});
+    if (this.disconnecting) await this.disconnecting.catch(() => {});
+    if (attempt !== this.startupRevision) return;
+
+    if (this.conn.isAlive() || this.conn.reconnectManager?.isActive()) {
       logger.info(`runAutoConnect(${tag}): client already alive — disconnecting first`);
-      try { await this.disconnect(); } catch { /* swallow; we're about to reconnect */ }
+      const plannedDisconnect = this.disconnect();
+      const teardown = this.startupRevision;
+      await plannedDisconnect.catch(() => {});
+      if (teardown !== this.startupRevision) return;
+      attempt = this.stopPopulation();
     }
 
     logger.info(`runAutoConnect(${tag}): connecting to profile ${profile.name}`);
-    await this.connectProfile(profile);
+    const connecting = this.connectProfile(profile, attempt);
+    this.connecting = connecting;
+    try {
+      await connecting;
+    } finally {
+      if (this.connecting === connecting) this.connecting = null;
+    }
+    if (attempt !== this.startupRevision) return;
 
-    if (this.state !== SyncState.CONNECTED) {
+    const da = this.adapterMgr.dataAdapter;
+    if (!da || (this.state !== SyncState.CONNECTED && this.state !== SyncState.RECONNECTING)) {
       // A shadow-window auto-connect failed. `connectProfile` ALREADY
       // emitted a classified, cause-specific Notice (auth / host /
       // remote-path / patch) into THIS same shadow window on every
@@ -603,9 +629,9 @@ export default class RemoteSshPlugin extends Plugin {
     // the next time this window restarts Obsidian reads fresh settings
     // instead of the stale local copy (#342). Best-effort: a failure here
     // must not block rendering the vault.
-    const da = this.adapterMgr.dataAdapter;
+    const isCurrent = () => attempt === this.startupRevision && this.adapterMgr.dataAdapter === da;
     const hostAdapter = this.app.vault.adapter;
-    if (da && hostAdapter instanceof FileSystemAdapter) {
+    if (hostAdapter instanceof FileSystemAdapter) {
       const localConfigDir = path.join(
         hostAdapter.getBasePath(), this.app.vault.configDir,
       );
@@ -614,6 +640,7 @@ export default class RemoteSshPlugin extends Plugin {
         const cfg = await ShadowVaultBootstrap.pullSharedObsidianConfig(
           da, remoteConfigDir, localConfigDir,
         );
+        if (!isCurrent()) return;
         if (cfg.errored.length > 0) {
           // The connection is up but some shared-config files the
           // remote *had* couldn't be pulled (transient SSH error /
@@ -627,6 +654,7 @@ export default class RemoteSshPlugin extends Plugin {
           );
         }
       } catch (e) {
+        if (!isCurrent()) return;
         logger.warn(
           `runAutoConnect(${tag}): shared-config pull failed: ${errorMessage(e)}`,
         );
@@ -651,12 +679,13 @@ export default class RemoteSshPlugin extends Plugin {
       );
       try {
         await ShadowVaultBootstrap.pullCommunityPlugins(da, remoteConfigDir, localConfigDir, cpBasePath);
-        await ShadowVaultBootstrap.pushCommunityPlugins(da, remoteConfigDir, localConfigDir, cpBasePath);
+        if (isCurrent()) await ShadowVaultBootstrap.pushCommunityPlugins(da, remoteConfigDir, localConfigDir, cpBasePath);
       } catch (e) {
         logger.warn(
           `runAutoConnect(${tag}): community-plugins round-trip failed: ${errorMessage(e)}`,
         );
       }
+      if (!isCurrent()) return;
 
       // #429b: the startup installer (prepareForAutoConnect) ran BEFORE
       // the pull above — and not at all on a reconnect — so a plugin the
@@ -671,6 +700,7 @@ export default class RemoteSshPlugin extends Plugin {
       } catch (e) {
         logger.warn(`runAutoConnect(${tag}): post-pull plugin install failed: ${errorMessage(e)}`);
       }
+      if (!isCurrent()) return;
 
       // #429b binary round-trip: the marketplace installer above can't
       // fetch a BRAT / sideloaded plugin (it isn't on the registry). Run
@@ -684,10 +714,11 @@ export default class RemoteSshPlugin extends Plugin {
       try {
         const enabledIds = ShadowVaultBootstrap.readEnabledPluginIds(localConfigDir);
         await ShadowVaultBootstrap.pullPluginBinaries(da, remoteConfigDir, localConfigDir, enabledIds);
-        await ShadowVaultBootstrap.pushPluginBinaries(da, remoteConfigDir, localConfigDir, enabledIds);
+        if (isCurrent()) await ShadowVaultBootstrap.pushPluginBinaries(da, remoteConfigDir, localConfigDir, enabledIds);
       } catch (e) {
         logger.warn(`runAutoConnect(${tag}): plugin-binary round-trip failed: ${errorMessage(e)}`);
       }
+      if (!isCurrent()) return;
 
       // #342 push half: pull only brought remote→local. Without this,
       // a settings change made HERE never reaches the remote, so the
@@ -737,51 +768,93 @@ export default class RemoteSshPlugin extends Plugin {
 
     }
 
-    // Adapter is patched; build the file model so File Explorer
-    // renders the remote tree.
-    let summary: string;
+    const population = new VaultPopulation({
+      lazy: this.settings.lazyFolderLoad !== false,
+      builder: new VaultModelBuilder(this.app.vault, { TFile, TFolder }),
+      onProgress: (p) => {
+        if (isCurrent() && this.population === population) this.onPopulationProgress(p);
+      },
+    });
+    this.population = population;
+    if (this.state === SyncState.CONNECTED && !da.isReconnecting()) this.resumePopulation(da);
     try {
-      summary = await this.populateVaultFromRemote(`shadow-${tag}`);
+      const result = await population.populate(`shadow-${tag}`);
+      if (!isCurrent() || result.kind === 'cancelled' || this.state !== SyncState.CONNECTED) return;
+      if (result.kind === 'incomplete') {
+        const detail = result.truncated ? 'the remote listing was truncated' : result.summary;
+        new Notice(`Remote SSH: vault population incomplete — ${detail}. See console.log.`, 15_000);
+        return;
+      }
+      if (result.entries === 0) {
+        new Notice(
+          result.hiddenCount > 0
+            ? `Remote SSH: 0 visible files — all ${result.hiddenCount} walked entries are hidden dot-files.`
+            : 'Remote SSH: 0 files found on the remote. Check the profile’s remotePath.',
+          10_000,
+        );
+      }
+      new Notice(`Remote SSH: ${profile.name} ready — ${result.summary}`);
     } catch (e) {
+      if (!isCurrent()) return;
       const msg = errorMessage(e);
       logger.error(`runAutoConnect(${tag}): populate failed: ${msg}`);
       new Notice(`Remote SSH: connected but failed to populate vault — ${msg}`);
-      return;
     }
-    new Notice(`Remote SSH: ${profile.name} ready — ${summary}`);
   }
 
   private cancelReconnect(): void {
     if (!this.conn.reconnectManager?.isActive()) return;
+    this.reconnectRun = null;
+    this.restoreAdapter();
     this.conn.cancelReconnect();
-    this.adapterMgr.restore();
     this.setState(SyncState.ERROR);
     new Notice('Remote SSH: reconnect cancelled');
   }
 
   private async startReconnect(): Promise<void> {
+    if (this.reconnectRun) return;
+    this.population?.pause();
     if (!this.conn.activeProfile) {
       logger.warn('startReconnect: no active profile to reconnect with');
+      this.restoreAdapter();
       this.setState(SyncState.ERROR);
       return;
     }
     const maxRetries = this.settings.reconnectMaxRetries ?? DEFAULT_SETTINGS.reconnectMaxRetries;
     if (maxRetries <= 0) {
       logger.info('startReconnect: auto-reconnect disabled (reconnectMaxRetries <= 0)');
-      this.adapterMgr.restore();
+      this.restoreAdapter();
       this.setState(SyncState.ERROR);
       return;
     }
+    const run = { adapter: this.adapterMgr.dataAdapter };
+    this.reconnectRun = run;
+    const currentAdapter = () => {
+      if (this.reconnectRun !== run) return null;
+      // Initial patching may still be waiting on the bridge or offline queue.
+      const installed = this.adapterMgr.dataAdapter;
+      run.adapter ??= installed;
+      return run.adapter === installed ? installed : null;
+    };
     this.setState(SyncState.RECONNECTING);
     await this.conn.startReconnect({
       maxRetries,
-      setAdapterReconnecting: (on) => this.adapterMgr.dataAdapter?.setReconnecting(on),
-      onState: (s) => this.onReconnectStateChange(s),
+      setAdapterReconnecting: (on) => currentAdapter()?.setReconnecting(on),
+      onState: (s) => {
+        if (this.reconnectRun === run) this.onReconnectStateChange(s, currentAdapter());
+      },
       hooks: {
-        swapClient: (c) => this.adapterMgr.dataAdapter?.swapClient(c),
-        prepareListenerForReconnect: () => this.fsChangeListener.prepareForReconnect(),
+        swapClient: (client) => {
+          const da = currentAdapter();
+          if (!da) return;
+          da.setReconnecting(true);
+          da.swapClient(client, this.conn.rpcConnection ? '' : this.conn.activeRemoteBasePath ?? undefined);
+        },
+        prepareListenerForReconnect: () => {
+          if (this.reconnectRun === run) this.fsChangeListener.prepareForReconnect();
+        },
         resumeListenerAfterReconnect: async (rpc) => {
-          const da = this.adapterMgr.dataAdapter;
+          const da = currentAdapter();
           if (da) {
             await this.fsChangeListener.resumeAfterReconnect({
               rpcConnection: rpc,
@@ -797,7 +870,7 @@ export default class RemoteSshPlugin extends Plugin {
    * Project the manager's state onto the StatusBar + Notice surface
    * and, on terminal states, clean up.
    */
-  private onReconnectStateChange(s: ReconnectState): void {
+  private onReconnectStateChange(s: ReconnectState, da = this.adapterMgr.dataAdapter): void {
     // F22 — opt-in telemetry. No-op when disabled.
     telemetry.recordReconnect(s.kind);
     if (s.kind === 'waiting') {
@@ -812,23 +885,24 @@ export default class RemoteSshPlugin extends Plugin {
         `Remote SSH: Reconnecting (attempt ${s.attempt}/${s.totalAttempts})…`,
       );
     } else if (s.kind === 'recovered') {
-      this.adapterMgr.dataAdapter?.setReconnecting(false);
+      da?.setReconnecting(false);
       this.setState(SyncState.CONNECTED);
+      if (da) this.resumePopulation(da);
       new Notice('Remote SSH: reconnected');
+      this.reconnectRun = null;
       this.conn.reconnectManager = null;
       // Drain any writes that landed during the disconnect. Fire-and-
       // forget: the user's already-back state is independent of the
       // replay outcome, and individual op failures stay in the queue
       // for the next reconnect.
-      void this.adapterMgr.replayOfflineQueue('after-reconnect');
+      if (da) void this.adapterMgr.replayOfflineQueue('after-reconnect');
     } else if (s.kind === 'failed') {
       // Give up: tear the patched adapter down so Obsidian falls
       // back to local file:// reads instead of blocking forever on a
       // dead transport. restore() clears dataAdapter so the
       // setReconnecting flag goes with it.
-      this.sharedConfigWatcher?.stop();
-      this.sharedConfigWatcher = null;
-      this.adapterMgr.restore();
+      this.reconnectRun = null;
+      this.restoreAdapter();
       this.setState(SyncState.ERROR);
       // s.reason is a string from ReconnectManager; wrap into Error
       // so classifyError can run pattern matching on the message
@@ -842,7 +916,8 @@ export default class RemoteSshPlugin extends Plugin {
       new Notice(notice);
       this.conn.reconnectManager = null;
     } else if (s.kind === 'cancelled') {
-      this.adapterMgr.dataAdapter?.setReconnecting(false);
+      this.reconnectRun = null;
+      this.restoreAdapter();
       this.conn.reconnectManager = null;
     }
   }
@@ -853,29 +928,27 @@ export default class RemoteSshPlugin extends Plugin {
    * IDLE. Calling it from a stale UI button (where state was already
    * IDLE because the plugin had just reloaded) is a supported flow.
    */
-  async disconnect() {
+  disconnect(): Promise<void> {
     const wasActive = this.state !== SyncState.IDLE
       || this.conn.isAlive()
       || this.settings.activeProfileId !== null;
+    this.reconnectRun = null;
+    this.restoreAdapter();
     this.conn.cancelReconnect();
+    if (this.disconnecting) return this.disconnecting;
     // #149 — close the terminal pane(s) before tearing the SSH
     // session down so the shell channel close fires while the ssh2
     // Client is still around (cleaner teardown logs).
     this.app.workspace.detachLeavesOfType(VIEW_TYPE_REMOTE_TERMINAL);
-    // Stop the #342 config watcher before the transport goes — its
-    // flush pushes through the (about-to-be-restored) adapter.
-    this.sharedConfigWatcher?.stop();
-    this.sharedConfigWatcher = null;
-    this.adapterMgr.restore();
-    // Drop lazy-load state — the walker it captured is now disconnected. A
-    // stray File-Explorer click after this finds a null loader and no-ops.
-    this.lazyLoader = null;
-    // Same for the background full-index pass: its walker rides the transport
-    // we're about to tear down, so stop it before the socket goes. `cancel()`
-    // makes it bail at its next checkpoint (one folder / one depth level away),
-    // and dropping the reference makes its late progress emits no-ops.
-    this.backgroundIndexer?.cancel();
-    this.backgroundIndexer = null;
+    const disconnecting = this.finishDisconnect(wasActive).finally(() => {
+      this.disconnecting = null;
+    });
+    this.disconnecting = disconnecting;
+    return disconnecting;
+  }
+
+  private async finishDisconnect(wasActive: boolean): Promise<void> {
+    if (this.connecting) await this.connecting.catch(() => {});
     await this.conn.disconnectTransport();
     this.setState(SyncState.IDLE);
     if (this.settings.activeProfileId !== null) {
@@ -917,211 +990,65 @@ export default class RemoteSshPlugin extends Plugin {
     }
   }
 
-  /** Lazy per-folder loader (deepen-on-expand); null until a lazy connect. */
-  private lazyLoader: LazyFolderLoader | null = null;
-  private lazyExpandHookInstalled = false;
+  private population: VaultPopulation | null = null;
+  private startupRevision = 0;
+  private connecting: Promise<void> | null = null;
+  private disconnecting: Promise<void> | null = null;
+  private reconnectRun: object | null = null;
 
-  /** Background full-tree index; null until a lazy connect, dropped on disconnect. */
-  private backgroundIndexer: BackgroundIndexer | null = null;
-
-  /**
-   * Start (or restart) the background full-index pass that completes the vault
-   * model behind the lazy root-level populate.
-   *
-   * Fire-and-forget by design: connect returns immediately and the indexer
-   * trickles the rest of the tree into `vault.fileMap`, yielding to the renderer
-   * between units. Any previous pass (e.g. from the connect before a reconnect)
-   * is cancelled first, so only one indexer is ever live and a stale one can't
-   * write progress over the new one's.
-   */
-  private startBackgroundIndex(): void {
-    this.backgroundIndexer?.cancel();
-    const indexer: BackgroundIndexer = new BackgroundIndexer({
-      makeWalker: () => this.makeWalker(),
-      makeBuilder: () => new VaultModelBuilder(this.app.vault, { TFile, TFolder }),
-      // Folders the indexer has fully materialised don't need re-walking when the
-      // user later expands them in File Explorer.
-      markLoaded: (path) => this.lazyLoader?.markLoaded(path),
-      onProgress: (p) => this.onIndexProgress(indexer, p),
-    });
-    this.backgroundIndexer = indexer;
-    void indexer.start();
+  private stopPopulation(): number {
+    this.startupRevision++;
+    this.population?.stop();
+    this.population = null;
+    return this.startupRevision;
   }
 
-  /**
-   * Surface indexing honestly. Until the pass completes, search / graph /
-   * backlinks really ARE incomplete, so say so in the status bar rather than
-   * letting a vault that has registered 12 of 30 000 files look "ready".
-   *
-   * Non-nagging: status-bar text while it runs (no modal, no toast spam), and a
-   * single Notice when it finishes. A cancelled pass says nothing — the user
-   * disconnected; they don't need a report.
-   */
-  private onIndexProgress(indexer: BackgroundIndexer, p: IndexProgress): void {
-    // A pass superseded by a reconnect, or one still unwinding after disconnect,
-    // must not paint over the live session's status bar.
-    if (this.backgroundIndexer !== indexer) return;
-    if (this.state !== SyncState.CONNECTED) return;
-    if (!p.done) {
-      this.statusBar?.update(
-        SyncState.CONNECTED,
-        `Remote SSH: Indexing… ${p.files} files`,
-      );
-      return;
-    }
-    this.statusBar?.update(SyncState.CONNECTED);
-    if (p.cancelled) return;
-    // Nothing added means the connect populate had already registered the whole
-    // vault (a flat, root-only tree) — there was no gap, so there's nothing to
-    // announce. Announcing "0 files indexed" would be noise on every connect.
-    if (p.files + p.folders === 0) return;
-    new Notice(
-      `Remote SSH: vault index complete — ${p.files} files, ${p.folders} folders. ` +
-      'Search, graph and links now cover the whole vault.',
-    );
+  private restoreAdapter(): void {
+    const hadPopulation = this.population !== null;
+    this.stopPopulation();
+    // The config watcher pushes through the adapter being restored.
+    this.sharedConfigWatcher?.stop();
+    this.sharedConfigWatcher = null;
+    this.adapterMgr.restore();
+    if (hadPopulation && this.state === SyncState.CONNECTED) this.statusBar?.update(this.state);
   }
 
-  /** A fresh BulkWalker bound to the current session's transport + ignore list. */
-  private makeWalker(): BulkWalker {
-    return new BulkWalker({
-      adapter: this.app.vault.adapter,
+  private resumePopulation(da: SftpDataAdapter): void {
+    this.population?.resume({
+      adapter: { list: da.list.bind(da) },
       rpcConnection: this.conn.rpcConnection ?? undefined,
-      // Older profiles have no walkIgnoreDirs → fall back to the sensible
-      // defaults so existing users immediately benefit. An explicit empty
-      // array (user cleared it) means "ignore nothing" and is respected.
+      // An explicit empty ignore list is valid. Older profiles use the defaults.
       ignoreDirs: this.conn.activeProfile?.walkIgnoreDirs ?? [...DEFAULT_WALK_IGNORE_DIRS],
     });
   }
 
-  /**
-   * One delegated, capture-phase click listener that deepens a folder the
-   * first time it's expanded in File Explorer. Obsidian renders folder
-   * children from the in-memory model, does NOT re-list on expand, and exposes
-   * no public folder-expand event — hence the DOM hook on `.nav-folder-title`
-   * (which carries the folder's `data-path`; verified in a real-Obsidian
-   * spike). Idempotent per folder via LazyFolderLoader, so a click on an
-   * already-loaded folder (or a collapse) is a cheap no-op. Installed once;
-   * `registerDomEvent` tears it down on unload.
-   */
-  private installLazyExpandHook(): void {
-    if (this.lazyExpandHookInstalled) return;
-    this.lazyExpandHookInstalled = true;
-    this.registerDomEvent(activeDocument, 'click', (evt) => {
-      const title = (evt.target as HTMLElement | null)?.closest?.('.nav-folder-title');
-      const path = title?.getAttribute('data-path');
-      if (path == null) return;
-      void this.lazyLoader?.loadFolder(path);
-    }, { capture: true });
+  private onPopulationProgress(p: PopulationProgress): void {
+    if (this.state !== SyncState.CONNECTED) return;
+    if (p.kind === 'indexing') {
+      this.statusBar?.update(SyncState.CONNECTED, `Remote SSH: Indexing… ${p.files} files`);
+      return;
+    }
+    this.statusBar?.update(SyncState.CONNECTED);
+    if (p.kind === 'incomplete') {
+      new Notice('Remote SSH: vault index incomplete — some folders are still retryable. See console.log.');
+    } else if (p.files + p.folders > 0) {
+      new Notice(
+        `Remote SSH: vault index complete — ${p.files} files, ${p.folders} folders. ` +
+        'Search, graph and links now cover the whole vault.',
+      );
+    }
   }
 
   /**
-   * POC for the shadow-vault architecture (see
-   * docs/en/architecture/shadow-vault.md, Phase 1): walk the patched
-   * adapter, then hand the resulting entry list to `VaultModelBuilder`
-   * which materialises TFile/TFolder objects in `app.vault.fileMap`
-   * and fires `vault.trigger('create', file)` for each new file. File
-   * Explorer should redraw with the remote tree.
-   *
-   * Stat is intentionally skipped per file in this POC — every entry
-   * lands with zero ctime/mtime/size. Shadow-vault Phase 4 will
-   * decide whether to batch-stat at walk time or stat lazily.
-   *
-   * Run from a vault that's already connected to a profile via the
-   * existing in-place patch flow (Tier 1-A); the command is hidden
-   * unless `this.conn.client?.isAlive()`.
+   * Obsidian renders File Explorer from its model and exposes no public folder
+   * expand event. One delegated listener serves all population lifetimes.
    */
-  /**
-   * Walk the patched adapter and run `VaultModelBuilder` so File
-   * Explorer renders the remote tree. Public so both the debug
-   * command and the Phase 4 auto-connect flow share one path.
-   *
-   * Stat is intentionally skipped per file — every entry lands with
-   * zero ctime/mtime/size. Subsequent file accesses fault in real
-   * stat values via the patched adapter as needed; a Phase 6
-   * follow-up can switch to a daemon-side batch-stat if it shows
-   * up in profiles.
-   *
-   * Returns a short summary string suitable for a Notice; logs the
-   * full counts + first 5 errors via `logger.info`/`logger.warn`.
-   */
-  async populateVaultFromRemote(label: string = 'remote'): Promise<string> {
-    const start = Date.now();
-
-    // Phase E1-α.2: prefer the daemon's `fs.walk` (one RPC, real
-    // mtime+size per entry) when the active session is RPC AND the
-    // daemon advertises the capability. Otherwise BulkWalker
-    // transparently runs the legacy BFS via the patched adapter.
-    const walker = this.makeWalker();
-    // Lazy mode (default): walk only the ROOT level and deepen each folder on
-    // first expand, so a deep, dir-heavy vault doesn't pull + materialise tens
-    // of thousands of entries at connect. `walkIgnoreDirs` is applied per level
-    // either way. Set `lazyFolderLoad: false` to restore the full eager walk.
-    const lazy = this.settings.lazyFolderLoad !== false;
-    const walk = await walker.walk('', !lazy);
-    logger.info(
-      `populateVaultFromRemote(${label}): ${walk.source}, ${walk.entries.length} entries ` +
-      `(${walk.hiddenCount} hidden) in ${walk.walkMs}ms (pages=${walk.pages})${lazy ? ' [lazy: root level]' : ''}` +
-      (walk.fastPathError ? ` (fast-path fallback: ${walk.fastPathError})` : ''),
-    );
-
-    const builder = new VaultModelBuilder(this.app.vault, { TFile, TFolder });
-    // Chunked so even one level (or a full eager walk) fills the File Explorer
-    // progressively instead of freezing the window while every entry is
-    // materialised + `create`-triggered in a single JS tick.
-    const result = await builder.buildChunked(walk.entries);
-    const totalMs = Date.now() - start;
-
-    if (lazy) {
-      // Obsidian renders folders from the in-memory model and does NOT re-list
-      // on expand, so deepen-on-expand is driven by a File-Explorer click hook.
-      this.lazyLoader = new LazyFolderLoader(
-        () => this.makeWalker(),
-        () => new VaultModelBuilder(this.app.vault, { TFile, TFolder }),
-      );
-      this.lazyLoader.markLoaded('');
-      this.installLazyExpandHook();
-      // The root level is on screen and connect is done — now index the REST of
-      // the tree in the background. Without this, everything below depth 1 stays
-      // out of `vault.fileMap` until the user happens to click the folder open,
-      // and Obsidian resolves links/embeds/search only against `fileMap` — so a
-      // link into an unexpanded subfolder silently fails to resolve. Deliberately
-      // NOT awaited: connect must stay fast, and the indexer yields between units.
-      this.startBackgroundIndex();
-    }
-    // `lazyFolderLoad: false` needs no background pass — the walk above was
-    // already the full recursive tree, so `fileMap` is complete on return.
-
-    const summary =
-      `${result.filesAdded}f + ${result.foldersAdded}d built, ` +
-      `${result.skipped} skipped, ${result.errors.length} errors (${totalMs}ms)`;
-    if (result.errors.length > 0) {
-      logger.warn(
-        `populateVaultFromRemote(${label}): first 5 errors: ` +
-        JSON.stringify(result.errors.slice(0, 5), null, 2),
-      );
-    }
-
-    // Don't let a failed/clipped populate look like a working-but-empty
-    // vault (the silent "remote files won't open" symptom). Surface it.
-    if (walk.entries.length === 0) {
-      new Notice(
-        walk.hiddenCount > 0
-          ? `Remote SSH: 0 visible files — all ${walk.hiddenCount} walked ` +
-            'entries are hidden dot-files (e.g. content under a “.”-prefixed ' +
-            'folder). Rename them if they should appear in the vault.'
-          : 'Remote SSH: 0 files found on the remote. Check the profile’s ' +
-            'remotePath actually points at the vault (see console.log).',
-        10_000,
-      );
-    } else if (walk.truncated) {
-      new Notice(
-        `Remote SSH: remote tree is very large — loaded ${walk.entries.length} ` +
-        'entries but it is still incomplete. Point the profile’s remotePath ' +
-        'at the vault folder, not a large parent directory (see console.log).',
-        15_000,
-      );
-    }
-    return summary;
+  private installExpandHook(): void {
+    this.registerDomEvent(activeDocument, 'click', (evt) => {
+      const title = (evt.target as HTMLElement | null)?.closest?.('.nav-folder-title');
+      const path = title?.getAttribute('data-path');
+      if (path != null) void this.population?.expand(path);
+    }, { capture: true });
   }
 
   /**
@@ -1352,12 +1279,9 @@ export default class RemoteSshPlugin extends Plugin {
   }
 
   private debugRestoreAdapter(): void {
-    if (!this.adapterMgr.isPatched()) {
-      new Notice('Remote SSH: adapter is not patched');
-      return;
-    }
-    this.adapterMgr.restore();
-    new Notice('Remote SSH: adapter restored');
+    const patched = this.adapterMgr.isPatched();
+    this.restoreAdapter();
+    new Notice(patched ? 'Remote SSH: adapter restored' : 'Remote SSH: adapter is not patched');
   }
 
   private async debugListRoot(): Promise<void> {
