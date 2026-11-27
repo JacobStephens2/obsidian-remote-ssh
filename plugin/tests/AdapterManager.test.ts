@@ -314,3 +314,31 @@ describe('AdapterManager filesystem lifetime', () => {
     expect(h.close).toHaveBeenCalledTimes(2);
   });
 });
+
+it.each([true, false])('dismisses an obsolete settings conflict modal on transport abort (ancestor: %s)', async (hasAncestor) => {
+  const h = harness({}, false, false);
+  vi.stubGlobal('document', { createElement: () => ({ appendChild() {} }) });
+  const open = vi.spyOn(obsidian.Modal.prototype, 'open').mockImplementation(() => {});
+  const close = vi.spyOn(obsidian.Modal.prototype, 'close').mockImplementation(() => {});
+  try {
+    expect(await h.mgr.patch()).toBe(true);
+    const adapter = h.mgr.dataAdapter!;
+    const controller = new AbortController();
+    const setting = '.custom/app.json';
+    h.remote.readBinary.mockResolvedValue(Buffer.from('{"remote":true}'));
+    if (hasAncestor) await adapter.readDeviceSetting(setting, controller.signal);
+    else await adapter.readBinary(setting);
+    h.remote.writeBinary.mockRejectedValueOnce(
+      Object.assign(new Error('Remote changed'), { code: -32020 }),
+    );
+    const write = adapter.writeDeviceSetting(setting, '{"local":true}', controller.signal);
+    const rejection = expect(write).rejects.toThrow('transport ended');
+    await vi.waitFor(() => expect(open).toHaveBeenCalledOnce());
+    controller.abort(new Error('transport ended'));
+    await rejection;
+    expect(close).toHaveBeenCalledOnce();
+  } finally {
+    open.mockRestore();
+    close.mockRestore();
+  }
+});

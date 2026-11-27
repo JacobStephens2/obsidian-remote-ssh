@@ -839,7 +839,7 @@ describe('SftpDataAdapter (read-side)', () => {
       );
       await adapter.read('note.md'); // primes mtime
       await adapter.write('note.md', 'force');
-      expect(onConflict).toHaveBeenCalledWith('note.md');
+      expect(onConflict).toHaveBeenCalledWith('note.md', undefined);
       expect(writeCalls).toHaveLength(2);
       expect(writeCalls[0].expected).toBeDefined();
       expect(writeCalls[1].expected).toBeUndefined();
@@ -854,7 +854,7 @@ describe('SftpDataAdapter (read-side)', () => {
       );
       await adapter.read('note.md');
       await expect(adapter.write('note.md', 'no')).rejects.toMatchObject({ code: -32020 });
-      expect(onConflict).toHaveBeenCalledWith('note.md');
+      expect(onConflict).toHaveBeenCalledWith('note.md', undefined);
     });
 
     it('rethrows when there is no onWriteConflict callback', async () => {
@@ -1070,7 +1070,7 @@ describe('SftpDataAdapter (read-side)', () => {
       await adapter.readBinary('note.md');
       await adapter.write('note.md', 'force');
       expect(onText).not.toHaveBeenCalled();
-      expect(onLegacy).toHaveBeenCalledWith('note.md');
+      expect(onLegacy).toHaveBeenCalledWith('note.md', undefined);
       expect(writeCalls[1].expected).toBeUndefined();
     });
 
@@ -1090,7 +1090,7 @@ describe('SftpDataAdapter (read-side)', () => {
       await adapter.read('note.md');
       await adapter.writeBinary('note.md', new Uint8Array([1, 2, 3]).buffer);
       expect(onText).not.toHaveBeenCalled();
-      expect(onLegacy).toHaveBeenCalledWith('note.md');
+      expect(onLegacy).toHaveBeenCalledWith('note.md', undefined);
       expect(writeCalls).toHaveLength(2);
     });
   });

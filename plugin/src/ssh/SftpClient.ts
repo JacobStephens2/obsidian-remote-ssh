@@ -106,6 +106,7 @@ export class SftpClient {
   private client: Client | null = null;
   private sftp: SFTPWrapper | null = null;
   private profile: SshProfile | null = null;
+  private readonly abandonedSettingsStages = new Map<string, { profile: SshProfile | null; remotePath: string }>();
   private closeListeners: CloseListener[] = [];
   private intentionalDisconnect = false;
   private remoteHome: string | null = null;
@@ -544,6 +545,11 @@ export class SftpClient {
   private async atomicWrite(remotePath: string, data: Buffer, checkConnected?: () => void): Promise<void> {
     checkConnected?.();
     const sftp = this.requireSftp();
+    const { profile } = this;
+    if (checkConnected && this.abandonedSettingsStages.size > 0) {
+      await this.cleanAbandonedSettingsStages(sftp, profile, remotePath, checkConnected);
+      checkConnected();
+    }
     const tmpPath = (checkConnected ? `${remotePath}.${randomUUID()}` : remotePath) + TMP_SUFFIX;
     try {
       await new Promise<void>((resolve, reject) => {
@@ -552,10 +558,27 @@ export class SftpClient {
       checkConnected?.();
       await this.rename(tmpPath, remotePath);
     } catch (e) {
-      // Finish cleaning up the issued operation on its original channel.
-      // A replacement transport may already be staging its own snapshot.
+      try {
+        checkConnected?.();
+      } catch {
+        // The abandoned upload owns a unique temp. A later live write to
+        // this setting can remove it without reviving the cancelled request.
+        this.abandonedSettingsStages.set(tmpPath, { profile, remotePath });
+        throw e;
+      }
       try { await this.unlink(sftp, tmpPath); } catch { /* ignore cleanup failure */ }
       throw e;
+    }
+  }
+
+  private async cleanAbandonedSettingsStages(
+    sftp: SFTPWrapper, profile: SshProfile | null, remotePath: string, checkConnected: () => void,
+  ): Promise<void> {
+    for (const [temporary, abandoned] of this.abandonedSettingsStages) {
+      if (abandoned.profile !== profile || abandoned.remotePath !== remotePath) continue;
+      checkConnected();
+      try { await this.unlink(sftp, temporary); } catch { /* best effort */ }
+      this.abandonedSettingsStages.delete(temporary);
     }
   }
 

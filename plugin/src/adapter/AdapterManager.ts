@@ -32,6 +32,16 @@ import { logger } from '../util/logger';
 import { errorMessage } from '../util/errorMessage';
 import * as path from 'path';
 
+function promptConflict<T>(modal: { prompt(): Promise<T>; close(): void }, signal?: AbortSignal): Promise<T> {
+  signal?.throwIfAborted();
+  const decision = modal.prompt();
+  if (!signal) return decision;
+  const dismiss = () => modal.close();
+  signal.addEventListener('abort', dismiss, { once: true });
+  if (signal.aborted) dismiss();
+  return decision.finally(() => signal.removeEventListener('abort', dismiss));
+}
+
 /**
  * The set of FileSystemAdapter methods that get monkey-patched onto
  * `app.vault.adapter` when the plugin is connected. Kept here so
@@ -244,8 +254,8 @@ export class AdapterManager {
       fsClient,
       this.readCache,
       this.ancestorTracker,
-      (vaultPath, panes) => new ThreeWayMergeModal(this.app, { path: vaultPath, ...panes }).prompt(),
-      (vaultPath) => new WriteConflictModal(this.app, vaultPath).prompt(),
+      (vaultPath, panes, signal) => promptConflict(new ThreeWayMergeModal(this.app, { path: vaultPath, ...panes }), signal),
+      (vaultPath, signal) => promptConflict(new WriteConflictModal(this.app, vaultPath), signal),
     );
     this._dataAdapter = new SftpDataAdapter(
       fsClient,

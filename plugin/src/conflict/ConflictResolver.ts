@@ -16,10 +16,11 @@ export type TextConflictDecision =
   | { decision: 'merged'; content: string }
   | { decision: 'cancel' };
 
-export type WriteConflictCallback = (vaultPath: string) => Promise<boolean>;
+export type WriteConflictCallback = (vaultPath: string, signal?: AbortSignal) => Promise<boolean>;
 export type TextConflictCallback = (
   vaultPath: string,
   panes: ThreeWayPanes,
+  signal?: AbortSignal,
 ) => Promise<TextConflictDecision>;
 
 export interface ConnectedWriteRequest {
@@ -111,7 +112,7 @@ export class ConflictResolver {
           ancestor: ancestor.content,
           mine:     mine.toString('utf8'),
           theirs:   theirsBuf.toString('utf8'),
-        }).catch(() => ({ decision: 'cancel' as const }));
+        }, request?.signal).catch(() => ({ decision: 'cancel' as const }));
         const decision = await waitForDecision(prompt, request?.signal);
         request?.checkConnected();
 
@@ -159,7 +160,7 @@ export class ConflictResolver {
     { client, request }: ConflictTransport,
   ): Promise<Buffer> {
     if (!this.onWriteConflict) throw originalError;
-    const prompt = this.onWriteConflict(normalizedPath).catch(() => false);
+    const prompt = this.onWriteConflict(normalizedPath, request?.signal).catch(() => false);
     const overwrite = await waitForDecision(prompt, request?.signal);
     request?.checkConnected();
     if (!overwrite) throw originalError;
