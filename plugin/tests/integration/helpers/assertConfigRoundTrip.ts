@@ -1,13 +1,14 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { ShadowVaultBootstrap, type ShadowVaultLayout } from '../../../src/shadow/ShadowVaultBootstrap';
+import { stageDeviceSettings } from '../../../src/shadow/DeviceSettingsSync';
 import type { SshProfile } from '../../../src/types';
 import type { TestClient } from './makeAdapter';
 
 /**
  * `assertConfigRoundTrip` — Layer 2 of the sync-test framework.
  *
- * Validates that a configurable allowlist of shared Obsidian config
+ * Validates that a configurable allowlist of per-device Obsidian settings
  * files survives a plugin restart: any content written to the remote
  * during one session must be visible to Obsidian on the next session,
  * which means it must end up on the local shadow-vault disk before
@@ -18,13 +19,8 @@ import type { TestClient } from './makeAdapter';
  * whose remote already carries `<configDir>/app.json` (etc.), the
  * local file must equal the remote.
  *
- * The remote-pull step is `ShadowVaultBootstrap.pullSharedObsidianConfig`
- * (#342 fix): `bootstrap()` itself is still purely-local, so this
- * helper runs the pull right after it — the same sequence the
- * production connect flow uses (`runAutoConnect` → pull → populate).
- * The assertion passes once that pull lands the remote bytes on the
- * local shadow disk; it fails (with the #342-gap message below) if a
- * regression drops the pull.
+ * Bootstrap is purely local. The helper runs the production settings
+ * pull after it and checks that the remote bytes land on the shadow disk.
  *
  * Why this is its own helper (vs. inlined in the test): the round-trip
  * setup has three independent moving parts (seed remote, run bootstrap,
@@ -78,28 +74,15 @@ export async function assertConfigRoundTrip(
   // adapter would write through to.
   const remoteConfigDir = `.obsidian`;
   const remoteRelPath = `${remoteConfigDir}/${configBasename}`;
-  const remoteAbsPath = `${remoteClient.vaultRoot}/${remoteRelPath}`;
+  const remoteAbsPath = remoteClient.adapter.toRemote(remoteRelPath);
 
   // Ensure the parent exists; SftpDataAdapter.mkdirp handles "exists ok".
   await remoteClient.adapter.mkdir(remoteConfigDir);
   await remoteClient.adapter.write(remoteRelPath, JSON.stringify(remoteContent));
 
-  // ── 2. Run bootstrap, then pull shared config ──────────────────────
-  //
-  // `bootstrap()` is purely-local: it creates the shadow vault dir
-  // structure and seeds `community-plugins.json` + `data.json`. The
-  // remote→local pull for the shared-config allowlist is a separate
-  // async step (it needs the connected adapter, which bootstrap has
-  // no handle on). The production connect flow runs the exact same
-  // call right before `populateVaultFromRemote`; this mirrors it so
-  // the test exercises the real round-trip path. Closing this gap is
-  // the #342 fix.
+  // ── 2. Run bootstrap, then stage per-device settings ──────────────
   const result = await bootstrap.bootstrap(profile, allProfiles);
-  await ShadowVaultBootstrap.pullSharedObsidianConfig(
-    remoteClient.adapter,
-    remoteConfigDir,
-    result.layout.configDir,
-  );
+  await stageDeviceSettings({ remoteConfigDir, localConfigDir: result.layout.configDir }, remoteClient.adapter);
 
   // ── 3. Compare local ↔ remote ─────────────────────────────────────
   const localAbsPath = path.join(result.layout.configDir, configBasename);
@@ -107,7 +90,7 @@ export async function assertConfigRoundTrip(
     throw new Error(
       `${labelPrefix(label)}local shadow vault missing ${configBasename}; ` +
       `remote ${remoteAbsPath} has it but bootstrap did not pull. ` +
-      `This is the #342 gap: shared Obsidian config doesn't round-trip.`,
+      `This is the #342 gap: per-device Obsidian settings don't round-trip.`,
     );
   }
 

@@ -75,6 +75,9 @@ The integration / beta channel. Day-to-day work merges here; every merge publish
 
 ## P
 
+**Per-device Obsidian settings**
+The four Obsidian JSON settings files kept on the shadow vault's local disk and backed up remotely under its Client ID. They are `app.json`, `appearance.json`, `core-plugins.json`, and `hotkeys.json`.
+
 **Profile** *(SSH)*
 A named connection target — host, port, user, auth, remote vault path, optional jump-host chain. Configured under **Settings → Profiles**. See [[en/configuration/profiles|Configuration → Profiles]].
 

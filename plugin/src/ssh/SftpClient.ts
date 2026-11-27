@@ -1,4 +1,5 @@
 import { Client } from 'ssh2';
+import { randomUUID } from 'node:crypto';
 import type { ClientChannel, ConnectConfig, KeyboardInteractiveCallback, Prompt, PseudoTtyOptions, SFTPWrapper, Stats } from 'ssh2';
 import type { Duplex } from 'stream';
 import type { RemoteEntry, RemoteStat, SshProfile } from '../types';
@@ -105,6 +106,7 @@ export class SftpClient {
   private client: Client | null = null;
   private sftp: SFTPWrapper | null = null;
   private profile: SshProfile | null = null;
+  private readonly abandonedSettingsStages = new Map<string, { profile: SshProfile | null; remotePath: string }>();
   private closeListeners: CloseListener[] = [];
   private intentionalDisconnect = false;
   private remoteHome: string | null = null;
@@ -531,8 +533,8 @@ export class SftpClient {
 
   // ─── write-side ──────────────────────────────────────────────────────────
 
-  async writeBinary(remotePath: string, data: Buffer): Promise<void> {
-    return this.atomicWrite(remotePath, data);
+  async writeBinary(remotePath: string, data: Buffer, checkConnected?: () => void): Promise<void> {
+    return this.atomicWrite(remotePath, data, checkConnected);
   }
 
   async writeText(remotePath: string, data: string, encoding: SftpEncoding = 'utf8'): Promise<void> {
@@ -540,17 +542,43 @@ export class SftpClient {
   }
 
   /** Best-effort overwrite via tmp file + atomic rename. Cleans up tmp on failure. */
-  private async atomicWrite(remotePath: string, data: Buffer): Promise<void> {
+  private async atomicWrite(remotePath: string, data: Buffer, checkConnected?: () => void): Promise<void> {
+    checkConnected?.();
     const sftp = this.requireSftp();
-    const tmpPath = remotePath + TMP_SUFFIX;
+    const { profile } = this;
+    if (checkConnected && this.abandonedSettingsStages.size > 0) {
+      await this.cleanAbandonedSettingsStages(sftp, profile, remotePath, checkConnected);
+      checkConnected();
+    }
+    const tmpPath = (checkConnected ? `${remotePath}.${randomUUID()}` : remotePath) + TMP_SUFFIX;
     try {
       await new Promise<void>((resolve, reject) => {
         sftp.writeFile(tmpPath, data, err => err ? reject(asError(err)) : resolve());
       });
+      checkConnected?.();
       await this.rename(tmpPath, remotePath);
     } catch (e) {
-      try { await this.remove(tmpPath); } catch { /* ignore cleanup failure */ }
+      try {
+        checkConnected?.();
+      } catch {
+        // The abandoned upload owns a unique temp. A later live write to
+        // this setting can remove it without reviving the cancelled request.
+        this.abandonedSettingsStages.set(tmpPath, { profile, remotePath });
+        throw e;
+      }
+      try { await this.unlink(sftp, tmpPath); } catch { /* ignore cleanup failure */ }
       throw e;
+    }
+  }
+
+  private async cleanAbandonedSettingsStages(
+    sftp: SFTPWrapper, profile: SshProfile | null, remotePath: string, checkConnected: () => void,
+  ): Promise<void> {
+    for (const [temporary, abandoned] of this.abandonedSettingsStages) {
+      if (abandoned.profile !== profile || abandoned.remotePath !== remotePath) continue;
+      checkConnected();
+      try { await this.unlink(sftp, temporary); } catch { /* best effort */ }
+      this.abandonedSettingsStages.delete(temporary);
     }
   }
 
@@ -576,7 +604,10 @@ export class SftpClient {
   }
 
   async remove(remotePath: string): Promise<void> {
-    const sftp = this.requireSftp();
+    return this.unlink(this.requireSftp(), remotePath);
+  }
+
+  private unlink(sftp: SFTPWrapper, remotePath: string): Promise<void> {
     return new Promise((resolve, reject) => {
       sftp.unlink(remotePath, err => err ? reject(asError(err)) : resolve());
     });
@@ -592,7 +623,8 @@ export class SftpClient {
    * is in the way we surface the conflict; otherwise we mkdir and let
    * a real SFTP error bubble up.
    */
-  async mkdir(remotePath: string): Promise<void> {
+  async mkdir(remotePath: string, checkConnected?: () => void): Promise<void> {
+    checkConnected?.();
     const sftp = this.requireSftp();
     try {
       const s = await this.stat(remotePath);
@@ -602,6 +634,7 @@ export class SftpClient {
       // Treat any stat failure as "path is not there yet" and try to create it.
       if (errorMessage(e)?.startsWith('mkdir: ')) throw e;
     }
+    checkConnected?.();
     return new Promise((resolve, reject) => {
       sftp.mkdir(remotePath, err => {
         if (err && !err.message.toLowerCase().includes('exist')) reject(asError(err));
@@ -610,7 +643,7 @@ export class SftpClient {
     });
   }
 
-  async mkdirp(remotePath: string): Promise<void> {
+  async mkdirp(remotePath: string, checkConnected?: () => void): Promise<void> {
     const isAbs = remotePath.startsWith('/');
     const parts = remotePath.split('/').filter(Boolean);
     let current = '';
@@ -618,7 +651,7 @@ export class SftpClient {
       current = isAbs
         ? current + '/' + part
         : (current ? current + '/' + part : part);
-      await this.mkdir(current);
+      await this.mkdir(current, checkConnected);
     }
   }
 

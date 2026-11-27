@@ -25,7 +25,7 @@ import { capturePhysicalFs, type PhysicalFs } from './PhysicalFs';
 import * as nodePath from 'path';
 import { pathToFileURL } from 'url';
 import type { MaterializedCache } from './MaterializedCache';
-import type { RemoteFsClient } from './RemoteFsClient';
+import { readRemoteFileIfPresent, type RemoteFsClient } from './RemoteFsClient';
 import type { WriterReflector } from './WriterReflector';
 import type { LocalOpRegistry } from './LocalOpRegistry';
 import type { ReadCache } from '../cache/ReadCache';
@@ -34,7 +34,7 @@ import type { PathMapper } from '../path/PathMapper';
 import type { ResourceBridge } from './ResourceBridge';
 import type { RemoteEntry } from '../types';
 import type { AncestorTracker } from '../conflict/AncestorTracker';
-import type { ConflictResolver } from '../conflict/ConflictResolver';
+import type { ConflictResolver, ConnectedWriteRequest } from '../conflict/ConflictResolver';
 import type { OfflineQueue, QueuedOp } from '../offline/OfflineQueue';
 import type { TransferTracker } from '../util/TransferTracker';
 import { logger } from '../util/logger';
@@ -72,7 +72,7 @@ export type { ThreeWayPanes, TextConflictDecision } from '../conflict/ConflictRe
  * boundary later.
  */
 export class SftpDataAdapter {
-  private listingRevision = 0;
+  private transportRevision = 0;
 
   constructor(
     private client: RemoteFsClient,
@@ -293,7 +293,7 @@ export class SftpDataAdapter {
   swapClient(newClient: RemoteFsClient, remoteBasePath = this.remoteBasePath): void {
     this.client = newClient;
     this.remoteBasePath = remoteBasePath;
-    this.listingRevision++;
+    this.transportRevision++;
     this.dirCache.clear();
     this.conflictResolver?.swapClient(newClient);
   }
@@ -313,6 +313,7 @@ export class SftpDataAdapter {
    * affected by the gate.
    */
   setReconnecting(on: boolean): void {
+    if (on && !this.reconnecting) this.transportRevision++;
     this.reconnecting = on;
   }
 
@@ -432,14 +433,14 @@ export class SftpDataAdapter {
     const plan = this.planList(normalizedPath);
     const primaryRemote = this.joinRemote(plan.primary);
     const userRemote = plan.mergeFromUser && plan.userSubtree ? this.joinRemote(plan.userSubtree) : null;
-    const { client, listingRevision } = this;
+    const { client, transportRevision } = this;
     const readListing = async (remotePath: string) => {
       signal?.throwIfAborted();
       const entries = await client.list(remotePath);
       signal?.throwIfAborted();
       // Ordinary reads may finish after a rebind with no signal. Their caller
       // can still use the result, but the new generation needs a fresh cache.
-      if (listingRevision === this.listingRevision) this.dirCache.put(remotePath, entries);
+      if (transportRevision === this.transportRevision) this.dirCache.put(remotePath, entries);
       return entries;
     };
 
@@ -502,8 +503,17 @@ export class SftpDataAdapter {
     return { primary: normalizedPath, mergeFromUser: false };
   }
 
-  async read(normalizedPath: string): Promise<string> {
-    const buf = await this.readBuffer(normalizedPath);
+  read(normalizedPath: string): Promise<string> {
+    return this.readText(normalizedPath);
+  }
+
+  readDeviceSetting(normalizedPath: string, signal: AbortSignal): Promise<string | null> {
+    return readRemoteFileIfPresent(() => this.readText(normalizedPath, this.connectedGuard(signal)));
+  }
+
+  private async readText(normalizedPath: string, checkConnected?: () => void): Promise<string> {
+    const buf = await this.readBuffer(normalizedPath, checkConnected);
+    checkConnected?.();
     this.cacheOnRead(normalizedPath, buf);
     const text = buf.toString('utf8');
     // Snapshot the just-read content so a subsequent conflicting write
@@ -575,6 +585,24 @@ export class SftpDataAdapter {
     } finally {
       perfTracer.end(__t1, { op: 'write', path: normalizedPath, bytes: data.length });
     }
+  }
+
+  /** Back up a snapshot that is already on the shadow disk. */
+  async writeDeviceSetting(normalizedPath: string, data: string, signal: AbortSignal): Promise<string> {
+    const checkConnected = this.connectedGuard(signal);
+    const request: ConnectedWriteRequest = {
+      signal,
+      checkConnected,
+      validateMerge: (content) => { JSON.parse(content); },
+    };
+    const { committed, mtime } = await this.writeBuffer(
+      normalizedPath, Buffer.from(data, 'utf8'), true, { request, mirrorConfig: false },
+    );
+    checkConnected();
+    const text = committed.toString('utf8');
+    this.ancestorTracker?.remember(normalizedPath, text, mtime);
+    this.applied([normalizedPath], r => r.reflectWrite(normalizedPath));
+    return text;
   }
 
   async writeBinary(normalizedPath: string, data: ArrayBuffer, _options?: DataWriteOptions): Promise<void> {
@@ -809,12 +837,12 @@ export class SftpDataAdapter {
       switch (op.kind) {
         case 'write': {
           const data = Buffer.from(op.contentBase64, 'base64');
-          await this.writeBuffer(op.path, data, true, op.expectedMtime);
+          await this.writeBuffer(op.path, data, true, { expectedMtime: op.expectedMtime });
           return { result: 'ok' };
         }
         case 'writeBinary': {
           const data = Buffer.from(op.contentBase64, 'base64');
-          await this.writeBuffer(op.path, data, false, op.expectedMtime);
+          await this.writeBuffer(op.path, data, false, { expectedMtime: op.expectedMtime });
           return { result: 'ok' };
         }
         case 'append': {
@@ -927,9 +955,11 @@ export class SftpDataAdapter {
    * time. The opportunistic stat after a fresh read is best-effort: a
    * failure is logged but does not block the read result.
    */
-  private async readBuffer(normalizedPath: string): Promise<Buffer> {
+  private async readBuffer(normalizedPath: string, checkConnected?: () => void): Promise<Buffer> {
+    checkConnected?.();
     const remote = this.toRemote(normalizedPath);
     const cached = this.readCache.peek(remote);
+    const { client } = this;
 
     // While reconnecting we can't talk to the remote at all. Serve
     // whatever is already in the cache so already-open editors keep
@@ -943,7 +973,8 @@ export class SftpDataAdapter {
     }
 
     if (cached) {
-      const s = await this.client.stat(remote);
+      const s = await client.stat(remote);
+      checkConnected?.();
       // Revalidate on mtime AND size. mtime alone is not enough: SFTP reports
       // it at 1-second resolution (`SftpClient`: `mtime: stats.mtime * 1000`),
       // so two edits inside the same wall-clock second collapse onto the same
@@ -969,7 +1000,8 @@ export class SftpDataAdapter {
       // before paying the bandwidth.
       const txId = this.transferTracker?.begin('down', normalizedPath, s.size ?? 0) ?? null;
       try {
-        const data = await this.client.readBinary(remote);
+        const data = await client.readBinary(remote);
+        checkConnected?.();
         this.readCache.put(remote, data, s.mtime);
         return data;
       } finally {
@@ -977,14 +1009,17 @@ export class SftpDataAdapter {
       }
     }
 
-    const data = await this.client.readBinary(remote);
+    const data = await client.readBinary(remote);
+    checkConnected?.();
     let mtime = 0;
     try {
-      const s = await this.client.stat(remote);
+      const s = await client.stat(remote);
       mtime = s.mtime;
     } catch (e) {
+      checkConnected?.();
       logger.warn(`stat-after-read failed for "${remote}": ${errorMessage(e)}`);
     }
+    checkConnected?.();
     this.readCache.put(remote, data, mtime);
     return data;
   }
@@ -1011,7 +1046,7 @@ export class SftpDataAdapter {
    * `data` may be reassigned in the merged-decision branch so the
    * post-write cache update reflects what actually landed on disk.
    *
-   * `expectedMtimeOverride` lets the offline-queue replayer
+   * `expectedMtime` lets the offline-queue replayer
    * (E2-β.3) feed in the mtime captured at *enqueue* time rather
    * than whatever the cache holds now (which is the synthetic
    * mtime from the offline cache update).
@@ -1101,27 +1136,33 @@ export class SftpDataAdapter {
     normalizedPath: string,
     data: Buffer,
     isText: boolean,
-    expectedMtimeOverride?: number,
-  ): Promise<void> {
+    { expectedMtime: override, request, mirrorConfig = true }:
+      { expectedMtime?: number; request?: ConnectedWriteRequest; mirrorConfig?: boolean } = {},
+  ): Promise<{ committed: Buffer; mtime: number }> {
+    const checkConnected = request?.checkConnected;
+    checkConnected?.();
+    const { client } = this;
     const remote = this.toRemote(normalizedPath);
     const parent = parentDirRemote(remote);
     if (parent && parent !== remote) {
-      await this.client.mkdirp(parent);
+      await client.mkdirp(parent, checkConnected);
+      checkConnected?.();
     }
 
     const cached = this.readCache.peek(remote);
-    const expectedMtime = expectedMtimeOverride ?? cached?.mtime;
+    const expectedMtime = override ?? cached?.mtime;
     let writtenData = data;
     const txId = this.transferTracker?.begin('up', normalizedPath, data.length) ?? null;
     try {
       try {
-        await this.client.writeBinary(remote, writtenData, expectedMtime);
+        await client.writeBinary(remote, writtenData, expectedMtime, checkConnected);
       } catch (e) {
+        checkConnected?.();
         if (expectedMtime === undefined || !isPreconditionFailed(e) || !this.conflictResolver) {
           throw e;
         }
         writtenData = await this.conflictResolver.resolve(
-          normalizedPath, remote, writtenData, isText, e,
+          normalizedPath, remote, writtenData, isText, e, request,
         );
       }
     } finally {
@@ -1130,19 +1171,30 @@ export class SftpDataAdapter {
 
     // The remote now holds `writtenData`. Mirror it onto the local shadow
     // disk too, so the next Obsidian start reads the real settings (#342/#429).
-    this.writeThroughConfig(normalizedPath, writtenData);
+    checkConnected?.();
+    if (mirrorConfig) this.writeThroughConfig(normalizedPath, writtenData);
 
     let mtime = 0;
     try {
-      const s = await this.client.stat(remote);
+      const s = await client.stat(remote);
       mtime = s.mtime;
     } catch (e) {
+      checkConnected?.();
       logger.warn(`stat-after-write failed for "${remote}": ${errorMessage(e)}`);
     }
+    checkConnected?.();
     this.readCache.put(remote, writtenData, mtime);
     this.dirCache.invalidate(parent);
+    return { committed: writtenData, mtime };
   }
 
+  private connectedGuard(signal: AbortSignal): () => void {
+    const { transportRevision } = this;
+    return () => {
+      signal.throwIfAborted();
+      if (this.reconnecting || this.transportRevision !== transportRevision) throw reconnectingError();
+    };
+  }
 
   /**
    * Drop cache entries for a path the daemon just reported as

@@ -55,7 +55,7 @@ describe('ConflictResolver.swapClient', () => {
     await resolver.resolve(NORM_PATH, REMOTE_PATH, MINE, true, ORIGINAL_ERROR);
 
     expect(firstWrite).not.toHaveBeenCalled();
-    expect(secondWrite).toHaveBeenCalledWith(REMOTE_PATH, MINE);
+    expect(secondWrite).toHaveBeenCalledWith(REMOTE_PATH, MINE, undefined, undefined);
   });
 });
 
@@ -88,7 +88,7 @@ describe('ConflictResolver.resolve — 3-way text path', () => {
     );
     const result = await resolver.resolve(NORM_PATH, REMOTE_PATH, MINE, true, ORIGINAL_ERROR);
     expect(result).toBe(MINE);
-    expect(writeSpy).toHaveBeenCalledWith(REMOTE_PATH, MINE);
+    expect(writeSpy).toHaveBeenCalledWith(REMOTE_PATH, MINE, undefined, undefined);
   });
 
   it('merged: writes merged content and returns the merged buffer', async () => {
@@ -102,6 +102,8 @@ describe('ConflictResolver.resolve — 3-way text path', () => {
     expect(writeSpy).toHaveBeenCalledWith(
       REMOTE_PATH,
       Buffer.from('hand-merged result', 'utf8'),
+      undefined,
+      undefined,
     );
   });
 
@@ -175,7 +177,7 @@ describe('ConflictResolver.resolve — 3-way text path', () => {
     );
     const result = await resolver.resolve(NORM_PATH, REMOTE_PATH, MINE, true, ORIGINAL_ERROR);
     expect(result).toBe(MINE);
-    expect(writeSpy).toHaveBeenCalledWith(REMOTE_PATH, MINE);
+    expect(writeSpy).toHaveBeenCalledWith(REMOTE_PATH, MINE, undefined, undefined);
   });
 
   it('ancestor === null falls through to two-choice modal', async () => {
@@ -228,7 +230,7 @@ describe('ConflictResolver.resolve — two-choice fallback (binary / no ancestor
     );
     const result = await resolver.resolve(NORM_PATH, REMOTE_PATH, MINE, false, ORIGINAL_ERROR);
     expect(result).toBe(MINE);
-    expect(writeSpy).toHaveBeenCalledWith(REMOTE_PATH, MINE);
+    expect(writeSpy).toHaveBeenCalledWith(REMOTE_PATH, MINE, undefined, undefined);
   });
 
   it('binary content (isText=false) always takes two-choice path even with ancestorTracker wired', async () => {

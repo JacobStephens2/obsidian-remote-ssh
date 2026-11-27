@@ -72,15 +72,16 @@ describe('SftpRemoteFsClient', () => {
     const wrap = new SftpRemoteFsClient(client);
     const buf = Buffer.from([1, 2, 3]);
 
-    await wrap.writeBinary('a.bin', buf);
-    await wrap.mkdirp('docs/sub');
+    const checkConnected = vi.fn();
+    await wrap.writeBinary('a.bin', buf, 1, checkConnected);
+    await wrap.mkdirp('docs/sub', checkConnected);
     await wrap.remove('trash.md');
     await wrap.rmdir('empty-dir', true);
     await wrap.rename('old.md', 'new.md');
     await wrap.copy('src.md', 'dst.md');
 
-    expect(calls.writeBinary).toEqual(['a.bin', buf]);
-    expect(calls.mkdirp).toEqual(['docs/sub']);
+    expect(calls.writeBinary).toEqual(['a.bin', buf, checkConnected]);
+    expect(calls.mkdirp).toEqual(['docs/sub', checkConnected]);
     expect(calls.remove).toEqual(['trash.md']);
     expect(calls.rmdir).toEqual(['empty-dir', true]);
     expect(calls.rename).toEqual(['old.md', 'new.md']);

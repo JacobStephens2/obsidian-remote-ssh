@@ -62,7 +62,7 @@ const TEMP_FILE = /(^\.DS_Store$)|(^Thumbs\.db$)|(^desktop\.ini$)|(^\.~lock\.)|(
  * `configDir` is excluded because `SftpDataAdapter.writeThroughConfig`
  * already owns that tree in the other direction — the local copy there
  * is a cache the plugin itself writes, so pushing it back would echo
- * our own bytes, and `SharedConfigWatcher` handles the files that DO
+ * our own bytes, and `DeviceSettingsSync` handles the files that DO
  * need to travel. `ignoreDirs` is the same list the remote walk prunes
  * (`DEFAULT_WALK_IGNORE_DIRS`): a directory we refuse to read from the
  * remote must not be pushed to it either.

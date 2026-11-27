@@ -2,7 +2,7 @@ import type { AncestorTracker } from './AncestorTracker';
 import type { RemoteFsClient } from '../adapter/RemoteFsClient';
 import type { ReadCache } from '../cache/ReadCache';
 import { logger } from '../util/logger';
-import { errorMessage } from '../util/errorMessage';
+import { asError, errorMessage } from '../util/errorMessage';
 
 export interface ThreeWayPanes {
   ancestor: string;
@@ -16,11 +16,38 @@ export type TextConflictDecision =
   | { decision: 'merged'; content: string }
   | { decision: 'cancel' };
 
-export type WriteConflictCallback = (vaultPath: string) => Promise<boolean>;
+export type WriteConflictCallback = (vaultPath: string, signal?: AbortSignal) => Promise<boolean>;
 export type TextConflictCallback = (
   vaultPath: string,
   panes: ThreeWayPanes,
+  signal?: AbortSignal,
 ) => Promise<TextConflictDecision>;
+
+export interface ConnectedWriteRequest {
+  signal: AbortSignal;
+  checkConnected: () => void;
+  validateMerge: (content: string) => void;
+}
+
+interface ConflictTransport {
+  client: RemoteFsClient;
+  request?: ConnectedWriteRequest;
+}
+
+async function waitForDecision<T>(decision: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return decision;
+  let abort!: () => void;
+  const cancelled = new Promise<never>((_resolve, reject) => {
+    abort = () => reject(asError(signal.reason));
+    signal.addEventListener('abort', abort, { once: true });
+    if (signal.aborted) abort();
+  });
+  try {
+    return await Promise.race([decision, cancelled]);
+  } finally {
+    signal.removeEventListener('abort', abort);
+  }
+}
 
 /**
  * Handles write-conflict resolution when the remote file changed since
@@ -63,41 +90,49 @@ export class ConflictResolver {
     mine: Buffer,
     isText: boolean,
     originalError: unknown,
+    request?: ConnectedWriteRequest,
   ): Promise<Buffer> {
+    const transport = { client: this.client, request };
     if (isText && this.ancestorTracker && this.onTextConflict) {
       const ancestor = this.ancestorTracker.get(normalizedPath);
       if (ancestor !== null) {
         let theirsBuf: Buffer;
         try {
-          theirsBuf = await this.client.readBinary(remote);
+          theirsBuf = await transport.client.readBinary(remote);
         } catch (re) {
+          request?.checkConnected();
           logger.warn(
             `ConflictResolver: re-read of "${remote}" failed (${errorMessage(re)}); ` +
             'falling back to the two-choice modal',
           );
-          return await this.fallbackTwoChoice(normalizedPath, remote, mine, originalError);
+          return await this.fallbackTwoChoice(normalizedPath, remote, mine, originalError, transport);
         }
-        const decision = await this.onTextConflict(normalizedPath, {
+        request?.checkConnected();
+        const prompt = this.onTextConflict(normalizedPath, {
           ancestor: ancestor.content,
           mine:     mine.toString('utf8'),
           theirs:   theirsBuf.toString('utf8'),
-        }).catch(() => ({ decision: 'cancel' as const }));
+        }, request?.signal).catch(() => ({ decision: 'cancel' as const }));
+        const decision = await waitForDecision(prompt, request?.signal);
+        request?.checkConnected();
 
         switch (decision.decision) {
           case 'keep-mine':
-            await this.client.writeBinary(remote, mine);
+            await transport.client.writeBinary(remote, mine, undefined, request?.checkConnected);
             return mine;
           case 'merged': {
+            request?.validateMerge(decision.content);
             const merged = Buffer.from(decision.content, 'utf8');
-            await this.client.writeBinary(remote, merged);
+            await transport.client.writeBinary(remote, merged, undefined, request?.checkConnected);
             return merged;
           }
           case 'keep-theirs': {
             let mtime = 0;
             try {
-              const s = await this.client.stat(remote);
+              const s = await transport.client.stat(remote);
               mtime = s.mtime;
             } catch { /* best effort */ }
+            request?.checkConnected();
             this.readCache.put(remote, theirsBuf, mtime);
             if (this.ancestorTracker) {
               this.ancestorTracker.remember(normalizedPath, theirsBuf.toString('utf8'), mtime);
@@ -109,7 +144,7 @@ export class ConflictResolver {
         }
       }
     }
-    return await this.fallbackTwoChoice(normalizedPath, remote, mine, originalError);
+    return await this.fallbackTwoChoice(normalizedPath, remote, mine, originalError, transport);
   }
 
   /**
@@ -122,11 +157,14 @@ export class ConflictResolver {
     remote: string,
     mine: Buffer,
     originalError: unknown,
+    { client, request }: ConflictTransport,
   ): Promise<Buffer> {
     if (!this.onWriteConflict) throw originalError;
-    const overwrite = await this.onWriteConflict(normalizedPath).catch(() => false);
+    const prompt = this.onWriteConflict(normalizedPath, request?.signal).catch(() => false);
+    const overwrite = await waitForDecision(prompt, request?.signal);
+    request?.checkConnected();
     if (!overwrite) throw originalError;
-    await this.client.writeBinary(remote, mine);
+    await client.writeBinary(remote, mine, undefined, request?.checkConnected);
     return mine;
   }
 }
