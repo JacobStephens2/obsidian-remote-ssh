@@ -7,6 +7,7 @@ import { ReadCache } from '../src/cache/ReadCache';
 import type { WalkParams, WalkResult } from '../src/proto/types';
 import { VaultModelBuilder, type ObsidianClassDeps } from '../src/vault/VaultModelBuilder';
 import { VaultPopulation, type PopulationProgress } from '../src/vault/VaultPopulation';
+import { deferred } from './helpers/deferred';
 
 class FakeFile {
   constructor(readonly vault: Vault, readonly path: string) {}
@@ -41,13 +42,6 @@ function harness(lazy = true, yields: { chunk?: () => Promise<void>; idle?: () =
 
 function listing(folders: string[] = [], files: string[] = []): ListedFiles {
   return { folders, files };
-}
-
-function deferred<T>() {
-  let resolve!: (value: T) => void;
-  let reject!: (reason: unknown) => void;
-  const promise = new Promise<T>((done, fail) => { resolve = done; reject = fail; });
-  return { promise, resolve, reject };
 }
 
 function page(paths: string[], truncated = false): WalkResult {

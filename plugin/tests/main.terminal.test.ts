@@ -1,4 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 vi.mock('../src/ui/RemoteTerminalView', () => ({
   RemoteTerminalView: class {}, VIEW_TYPE_REMOTE_TERMINAL: 'remote-terminal',
 }));
@@ -11,7 +14,9 @@ import type { ConnectionManager } from '../src/ConnectionManager';
 import RemoteSshPlugin from '../src/main';
 import { ShadowStartupCoordinator } from '../src/shadow/ShadowStartupCoordinator';
 import { ShadowVaultBootstrap } from '../src/shadow/ShadowVaultBootstrap';
+import { SftpClient } from '../src/ssh/SftpClient';
 import { SyncState } from '../src/types';
+import { deferred } from './helpers/deferred';
 
 type ReconnectOptions = Parameters<ConnectionManager['startReconnect']>[0];
 
@@ -121,7 +126,7 @@ describe('plugin terminal adapter lifetimes', () => {
       h.p.setState(SyncState.CONNECTED);
       return Promise.resolve();
     });
-    const { promise, reject } = Promise.withResolvers<string | null>();
+    const { promise, reject } = deferred<string | null>();
     const readDeviceSetting = vi.fn((_file: string, _signal: AbortSignal) => promise);
     Object.assign(h.adapterMgr.dataAdapter!, { readDeviceSetting });
     const community = vi.spyOn(ShadowVaultBootstrap, 'pullCommunityPlugins');
@@ -163,7 +168,7 @@ describe('plugin terminal adapter lifetimes', () => {
     const h = harness();
     h.settings.reconnectMaxRetries = 3;
     const rpc = { rpc: { call: vi.fn() }, info: { capabilities: ['fs.walk'] } };
-    const replay = Promise.withResolvers<void>();
+    const replay = deferred<void>();
     h.replayOfflineQueue.mockReturnValue(replay.promise);
     await h.p.startReconnect();
     expect(h.pause).toHaveBeenCalledBefore(h.startReconnect);
@@ -185,7 +190,7 @@ describe('plugin terminal adapter lifetimes', () => {
   it('ignores replay completion after another reconnect has started', async () => {
     const h = harness();
     h.settings.reconnectMaxRetries = 3;
-    const replay = Promise.withResolvers<void>();
+    const replay = deferred<void>();
     h.replayOfflineQueue.mockReturnValue(replay.promise);
     await h.p.startReconnect();
     h.startReconnect.mock.calls[0][0].onState({ kind: 'recovered' });
@@ -257,4 +262,37 @@ describe('plugin terminal adapter lifetimes', () => {
     expect(h.p.state).toBe(SyncState.ERROR);
     expect(h.resume).not.toHaveBeenCalled();
   });
+});
+
+it('stages the remote directory used by the destination shadow window', async () => {
+  const vaultDir = mkdtempSync(join(tmpdir(), 'shadow-settings-'));
+  try {
+    const app = new App();
+    app.vault.configDir = '.obsidian-source';
+    const plugin = new RemoteSshPlugin(app as never);
+    const stage = plugin as unknown as {
+      preSpawnPull(profile: object, result: object): Promise<void>;
+    };
+    vi.spyOn(SftpClient.prototype, 'connect').mockResolvedValue(undefined);
+    vi.spyOn(SftpClient.prototype, 'disconnect').mockResolvedValue(undefined);
+    vi.spyOn(SftpClient.prototype, 'exists').mockResolvedValue(false);
+    const remoteRead = vi.spyOn(SftpClient.prototype, 'readText').mockImplementation(async (file) => {
+      if (file === '/vault/.obsidian/user/shadow-client/app.json') return '{ "remote": true }\n';
+      throw Object.assign(new Error('missing'), { code: 2 });
+    });
+    const configDir = join(vaultDir, '.obsidian');
+    const pluginDir = join(configDir, 'plugins', 'remote-ssh');
+    const layout = { vaultDir, configDir, pluginDir, pluginDataFile: join(pluginDir, 'data.json') };
+    const file = join(configDir, 'app.json');
+    mkdirSync(configDir);
+    writeFileSync(file, '{}\n');
+    await stage.preSpawnPull({ id: 'p', name: 'Shadow', remotePath: '/vault' }, {
+      layout, clientId: 'shadow-client', registryId: 'shadow', registryCreated: true,
+      migrated: false, pluginInstallMethod: 'copy',
+    });
+    expect(remoteRead).toHaveBeenCalledWith('/vault/.obsidian/user/shadow-client/app.json');
+    expect(readFileSync(file, 'utf8')).toBe('{ "remote": true }\n');
+  } finally {
+    rmSync(vaultDir, { recursive: true, force: true });
+  }
 });

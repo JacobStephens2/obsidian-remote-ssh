@@ -1152,6 +1152,7 @@ export default class RemoteSshPlugin extends Plugin {
   private async preSpawnPull(profile: SshProfile, result: BootstrapResult): Promise<void> {
     const localConfigDir = result.layout.configDir;
     const remoteConfigDir = this.app.vault.configDir;
+    const settingsConfigDir = path.relative(result.layout.vaultDir, localConfigDir).split(path.sep).join('/');
     const remoteBase = normalizeRemotePath(profile.remotePath);
     // Apply the SAME per-client redirect the shadow window's adapter will use
     // (AdapterManager builds `new PathMapper(resolveClientId(settings), configDir)`),
@@ -1161,7 +1162,7 @@ export default class RemoteSshPlugin extends Plugin {
     // clobbered the per-device config on every spawn, undoing the redirect.
     // `PathMapper.toRemote` is identity for non-private paths (community-plugins.json,
     // plugins/…), so those still round-trip shared, unchanged.
-    const mapper = new PathMapper(ConnectionManager.resolveClientId(result), remoteConfigDir);
+    const mapper = new PathMapper(ConnectionManager.resolveClientId(result), settingsConfigDir);
     const toRemote = (p: string): string => preSpawnRemotePath(mapper, remoteBase, p);
 
     const client = new SftpClient(
@@ -1182,7 +1183,7 @@ export default class RemoteSshPlugin extends Plugin {
     const pull = (async () => {
       await client.connect(profile);
       if (signal.aborted) return;
-      await stageDeviceSettings({ remoteConfigDir, localConfigDir }, {
+      await stageDeviceSettings({ remoteConfigDir: settingsConfigDir, localConfigDir }, {
         readDeviceSetting: (p) => readRemoteFileIfPresent(() => reader.read(p)),
       }, signal);
       if (signal.aborted) return;

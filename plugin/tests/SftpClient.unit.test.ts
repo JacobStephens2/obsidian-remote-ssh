@@ -348,12 +348,20 @@ describe('SftpClient.readBinary() / readText()', () => {
 // ─── writeBinary (atomicWrite) ────────────────────────────────────────────────
 
 describe('SftpClient.writeBinary() — atomic write', () => {
-  it('does not rename a staged file when the connected settings request is cancelled', async () => {
+  it('cleans up a staged settings file on the original usable transport after cancellation', async () => {
     const sut = makeSut();
     const sftp = makeSftp();
+    const replacement = makeSftp();
     const controller = new AbortController();
-    sftp.writeFile.mockImplementation((_p: string, _d: Buffer, cb: (error: null) => void) => {
+    const staged = new Set<string>();
+    sftp.writeFile.mockImplementation((file: string, _d: Buffer, cb: (error: null) => void) => {
+      staged.add(file);
       controller.abort();
+      wire(sut, replacement);
+      cb(null);
+    });
+    sftp.unlink.mockImplementation((file: string, cb: (error: null) => void) => {
+      staged.delete(file);
       cb(null);
     });
     wire(sut, sftp);
@@ -361,7 +369,9 @@ describe('SftpClient.writeBinary() — atomic write', () => {
     await expect(sut.writeBinary('config/app.json', Buffer.from('{}'), () => controller.signal.throwIfAborted()))
       .rejects.toMatchObject({ name: 'AbortError' });
     expect(sftp.rename).not.toHaveBeenCalled();
-    expect(sftp.unlink).not.toHaveBeenCalled();
+    expect(replacement.rename).not.toHaveBeenCalled();
+    expect(replacement.unlink).not.toHaveBeenCalled();
+    expect([...staged]).toEqual([]);
   });
 
   it('success: calls writeFile on tmp path then rename to final path', async () => {

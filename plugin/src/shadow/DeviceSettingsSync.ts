@@ -199,10 +199,17 @@ export class DeviceSettingsSync {
     const signal = this.controller?.signal;
     if (!signal || this.flushing) return;
     this.flushing = true;
+    const candidates = [...this.dirty];
+    this.dirty.clear();
     const failed: SettingFile[] = [];
     try {
-      for (const basename of [...this.dirty]) {
-        this.dirty.delete(basename);
+      for (const basename of candidates) {
+        if (signal.aborted) {
+          if (!this.stopped) this.dirty.add(basename);
+          continue;
+        }
+        // An event since this batch started has its own debounce window.
+        if (this.dirty.has(basename)) continue;
         this.failed.delete(basename);
         try {
           await this.send(basename, signal);
@@ -213,7 +220,7 @@ export class DeviceSettingsSync {
               this.confirmed.delete(basename);
               this.dirty.add(basename);
             }
-            break;
+            continue;
           }
           logger.warn(`Device settings send: ${basename} (${errorMessage(e)})`);
           this.failed.add(basename);

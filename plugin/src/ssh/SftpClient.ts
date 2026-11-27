@@ -1,4 +1,5 @@
 import { Client } from 'ssh2';
+import { randomUUID } from 'node:crypto';
 import type { ClientChannel, ConnectConfig, KeyboardInteractiveCallback, Prompt, PseudoTtyOptions, SFTPWrapper, Stats } from 'ssh2';
 import type { Duplex } from 'stream';
 import type { RemoteEntry, RemoteStat, SshProfile } from '../types';
@@ -543,7 +544,7 @@ export class SftpClient {
   private async atomicWrite(remotePath: string, data: Buffer, checkConnected?: () => void): Promise<void> {
     checkConnected?.();
     const sftp = this.requireSftp();
-    const tmpPath = remotePath + TMP_SUFFIX;
+    const tmpPath = (checkConnected ? `${remotePath}.${randomUUID()}` : remotePath) + TMP_SUFFIX;
     try {
       await new Promise<void>((resolve, reject) => {
         sftp.writeFile(tmpPath, data, err => err ? reject(asError(err)) : resolve());
@@ -551,8 +552,9 @@ export class SftpClient {
       checkConnected?.();
       await this.rename(tmpPath, remotePath);
     } catch (e) {
-      checkConnected?.();
-      try { await this.remove(tmpPath); } catch { /* ignore cleanup failure */ }
+      // Finish cleaning up the issued operation on its original channel.
+      // A replacement transport may already be staging its own snapshot.
+      try { await this.unlink(sftp, tmpPath); } catch { /* ignore cleanup failure */ }
       throw e;
     }
   }
@@ -579,7 +581,10 @@ export class SftpClient {
   }
 
   async remove(remotePath: string): Promise<void> {
-    const sftp = this.requireSftp();
+    return this.unlink(this.requireSftp(), remotePath);
+  }
+
+  private unlink(sftp: SFTPWrapper, remotePath: string): Promise<void> {
     return new Promise((resolve, reject) => {
       sftp.unlink(remotePath, err => err ? reject(asError(err)) : resolve());
     });

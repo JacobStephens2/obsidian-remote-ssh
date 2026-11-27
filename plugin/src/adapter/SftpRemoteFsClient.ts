@@ -46,11 +46,11 @@ export class SftpRemoteFsClient implements RemoteFsClient {
     // the server "only write if mtime equals N" without a roundtrip
     // race. We accept the argument for interface parity but ignore
     // it; conflict detection is RPC-only.
-    return checkConnected ? this.client.writeBinary(path, data, checkConnected) : this.client.writeBinary(path, data);
+    return this.client.writeBinary(path, data, checkConnected);
   }
 
   mkdirp(path: string, checkConnected?: () => void): Promise<void> {
-    return checkConnected ? this.client.mkdirp(path, checkConnected) : this.client.mkdirp(path);
+    return this.client.mkdirp(path, checkConnected);
   }
 
   remove(path: string): Promise<void> {

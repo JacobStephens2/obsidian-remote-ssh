@@ -34,7 +34,7 @@ import type { PathMapper } from '../path/PathMapper';
 import type { ResourceBridge } from './ResourceBridge';
 import type { RemoteEntry } from '../types';
 import type { AncestorTracker } from '../conflict/AncestorTracker';
-import type { ConflictResolver } from '../conflict/ConflictResolver';
+import type { ConflictResolver, ConnectedWriteRequest } from '../conflict/ConflictResolver';
 import type { OfflineQueue, QueuedOp } from '../offline/OfflineQueue';
 import type { TransferTracker } from '../util/TransferTracker';
 import { logger } from '../util/logger';
@@ -590,7 +590,14 @@ export class SftpDataAdapter {
   /** Back up a snapshot that is already on the shadow disk. */
   async writeDeviceSetting(normalizedPath: string, data: string, signal: AbortSignal): Promise<string> {
     const checkConnected = this.connectedGuard(signal);
-    const { committed, mtime } = await this.writeBuffer(normalizedPath, Buffer.from(data, 'utf8'), true, { checkConnected });
+    const request: ConnectedWriteRequest = {
+      signal,
+      checkConnected,
+      validateMerge: (content) => { JSON.parse(content); },
+    };
+    const { committed, mtime } = await this.writeBuffer(
+      normalizedPath, Buffer.from(data, 'utf8'), true, { request, mirrorConfig: false },
+    );
     checkConnected();
     const text = committed.toString('utf8');
     this.ancestorTracker?.remember(normalizedPath, text, mtime);
@@ -1039,7 +1046,7 @@ export class SftpDataAdapter {
    * `data` may be reassigned in the merged-decision branch so the
    * post-write cache update reflects what actually landed on disk.
    *
-   * `expectedMtimeOverride` lets the offline-queue replayer
+   * `expectedMtime` lets the offline-queue replayer
    * (E2-β.3) feed in the mtime captured at *enqueue* time rather
    * than whatever the cache holds now (which is the synthetic
    * mtime from the offline cache update).
@@ -1129,15 +1136,16 @@ export class SftpDataAdapter {
     normalizedPath: string,
     data: Buffer,
     isText: boolean,
-    { expectedMtime: override, checkConnected }: { expectedMtime?: number; checkConnected?: () => void } = {},
+    { expectedMtime: override, request, mirrorConfig = true }:
+      { expectedMtime?: number; request?: ConnectedWriteRequest; mirrorConfig?: boolean } = {},
   ): Promise<{ committed: Buffer; mtime: number }> {
+    const checkConnected = request?.checkConnected;
     checkConnected?.();
     const { client } = this;
     const remote = this.toRemote(normalizedPath);
     const parent = parentDirRemote(remote);
     if (parent && parent !== remote) {
-      if (checkConnected) await client.mkdirp(parent, checkConnected);
-      else await client.mkdirp(parent);
+      await client.mkdirp(parent, checkConnected);
       checkConnected?.();
     }
 
@@ -1147,15 +1155,14 @@ export class SftpDataAdapter {
     const txId = this.transferTracker?.begin('up', normalizedPath, data.length) ?? null;
     try {
       try {
-        if (checkConnected) await client.writeBinary(remote, writtenData, expectedMtime, checkConnected);
-        else await client.writeBinary(remote, writtenData, expectedMtime);
+        await client.writeBinary(remote, writtenData, expectedMtime, checkConnected);
       } catch (e) {
         checkConnected?.();
         if (expectedMtime === undefined || !isPreconditionFailed(e) || !this.conflictResolver) {
           throw e;
         }
         writtenData = await this.conflictResolver.resolve(
-          normalizedPath, remote, writtenData, isText, e, checkConnected,
+          normalizedPath, remote, writtenData, isText, e, request,
         );
       }
     } finally {
@@ -1165,7 +1172,7 @@ export class SftpDataAdapter {
     // The remote now holds `writtenData`. Mirror it onto the local shadow
     // disk too, so the next Obsidian start reads the real settings (#342/#429).
     checkConnected?.();
-    if (!checkConnected) this.writeThroughConfig(normalizedPath, writtenData);
+    if (mirrorConfig) this.writeThroughConfig(normalizedPath, writtenData);
 
     let mtime = 0;
     try {

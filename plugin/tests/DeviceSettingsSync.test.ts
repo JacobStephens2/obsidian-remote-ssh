@@ -3,6 +3,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { DeviceSettingsSync, stageDeviceSettings } from '../src/shadow/DeviceSettingsSync';
+import { deferred } from './helpers/deferred';
 
 const configDir = 'custom-config';
 const app = `${configDir}/app.json`;
@@ -67,6 +68,29 @@ describe('DeviceSettingsSync', () => {
     expect(requests().slice(2)).toEqual([[app, '{"changed": true}']]);
   });
 
+  it('debounces a fresh sibling save during an older in-flight flush', async () => {
+    const pending = deferred<string>();
+    const appValue = '{"app":1}';
+    write.mockReturnValueOnce(pending.promise);
+    save('app.json', appValue);
+    save('hotkeys.json', '{"keys":1}');
+    sync.startWatching();
+    onChange(null);
+    await debounce();
+    expect(write).toHaveBeenCalledOnce();
+
+    save('hotkeys.json', '{"keys":2}');
+    onChange('hotkeys.json');
+    pending.resolve(appValue);
+    await vi.advanceTimersByTimeAsync(100);
+    expect(write).toHaveBeenCalledOnce();
+
+    save('hotkeys.json', '{"keys":3}');
+    onChange('hotkeys.json');
+    await debounce();
+    expect(requests()).toEqual([[app, appValue], [hotkeys, '{"keys":3}']]);
+  });
+
   it('stages exact JSON and leaves each failed or missing local copy alone', async () => {
     save('app.json', '{"local": true}');
     save('appearance.json', '{"theme": "local"}');
@@ -94,7 +118,7 @@ describe('DeviceSettingsSync', () => {
 
   it('cannot publish an in-flight staging read after cancellation', async () => {
     const controller = new AbortController();
-    const pending = Promise.withResolvers<string>();
+    const pending = deferred<string>();
     read.mockReturnValueOnce(pending.promise);
     save('app.json', '{"local":true}');
     const staging = stageDeviceSettings({ localConfigDir, remoteConfigDir: configDir }, { readDeviceSetting: read }, controller.signal);
@@ -143,7 +167,7 @@ describe('DeviceSettingsSync', () => {
   });
 
   it.each([true, false])('sends a newer edit after the pending write settles (watch event: %s)', async (eventDelivered) => {
-    const pending = Promise.withResolvers<string>();
+    const pending = deferred<string>();
     const first = '{"edit":1}';
     const second = '{"edit":2}';
     write.mockReturnValueOnce(pending.promise);
@@ -178,7 +202,7 @@ describe('DeviceSettingsSync', () => {
   });
 
   it('sends a coalesced newer edit even when the previous snapshot was rejected', async () => {
-    const pending = Promise.withResolvers<string>();
+    const pending = deferred<string>();
     write.mockReturnValueOnce(pending.promise);
     save('app.json', '{"edit":1}');
     sync.startWatching();
@@ -191,7 +215,7 @@ describe('DeviceSettingsSync', () => {
   });
 
   it('preserves the settings installed before a transport loss and ends that pull', async () => {
-    const pending = Promise.withResolvers<string>();
+    const pending = deferred<string>();
     read.mockResolvedValueOnce('{ "installed": true }\n').mockReturnValueOnce(pending.promise);
     const pulling = sync.pull();
     await Promise.resolve();
@@ -214,7 +238,7 @@ describe('DeviceSettingsSync', () => {
   });
 
   it('retries pending and failed settings from current disk bytes after recovery', async () => {
-    const pending = Promise.withResolvers<string>();
+    const pending = deferred<string>();
     write.mockRejectedValueOnce(new Error('write failed')).mockReturnValueOnce(pending.promise);
     save('app.json', '{"app":1}');
     save('hotkeys.json', '{"hotkeys":1}');
@@ -238,7 +262,7 @@ describe('DeviceSettingsSync', () => {
   });
 
   it('stops the watch and suppresses late installs, sibling sends, and diagnostics after teardown', async () => {
-    const pending = Promise.withResolvers<string>();
+    const pending = deferred<string>();
     write.mockReturnValueOnce(pending.promise);
     save('app.json', '{"mine":true}');
     save('hotkeys.json', '[]');

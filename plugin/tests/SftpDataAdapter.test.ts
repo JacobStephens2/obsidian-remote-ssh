@@ -6,6 +6,8 @@ import { PathMapper } from '../src/path/PathMapper';
 import { AncestorTracker } from '../src/conflict/AncestorTracker';
 import { ConflictResolver, type TextConflictDecision } from '../src/conflict/ConflictResolver';
 import { OfflineQueue } from '../src/offline/OfflineQueue';
+import { DeviceSettingsSync } from '../src/shadow/DeviceSettingsSync';
+import { deferred } from './helpers/deferred';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import * as os from 'node:os';
@@ -818,14 +820,14 @@ describe('SftpDataAdapter (read-side)', () => {
       await adapter.read('note.md'); // primes cache with mtime=7
       fake.spies.writeBinary.mockClear();
       await adapter.write('note.md', 'updated');
-      expect(fake.spies.writeBinary).toHaveBeenCalledWith('/v/note.md', expect.any(Buffer), 7);
+      expect(fake.spies.writeBinary).toHaveBeenCalledWith('/v/note.md', expect.any(Buffer), 7, undefined);
     });
 
     it('omits expectedMtime when the cache has no entry for the path', async () => {
       const fake = makeFakeClient({});
       const adapter = new SftpDataAdapter(fake.client, '/v', readCache, dirCache, 'v');
       await adapter.write('new.md', 'hello'); // first-touch write, no cache hit
-      expect(fake.spies.writeBinary).toHaveBeenCalledWith('/v/new.md', expect.any(Buffer), undefined);
+      expect(fake.spies.writeBinary).toHaveBeenCalledWith('/v/new.md', expect.any(Buffer), undefined, undefined);
     });
 
     it('asks onWriteConflict + retries without expectedMtime when user picks overwrite', async () => {
@@ -1245,7 +1247,7 @@ describe('SftpDataAdapter (offline queue while reconnecting)', () => {
       expectedMtime: 42,
     });
     expect(result).toEqual({ result: 'ok' });
-    expect(fake.spies.writeBinary).toHaveBeenCalledWith('/v/a.md', expect.any(Buffer), 42);
+    expect(fake.spies.writeBinary).toHaveBeenCalledWith('/v/a.md', expect.any(Buffer), 42, undefined);
   });
 
   it('replayQueuedOp returns conflict on PreconditionFailed without an ancestor', async () => {
@@ -1688,6 +1690,15 @@ describe('SftpDataAdapter — config write-through to the local shadow disk (#34
     expect(fake.files[remote].data.toString()).toBe(merged);
   });
 
+  it('does not commit a malformed JSON settings merge', async () => {
+    const prompt = vi.fn(async (): Promise<TextConflictDecision> => ({ decision: 'merged', content: '{"incomplete":' }));
+    const { adapter, fake, remote, setting, signal } = await settingsConflict(prompt);
+    await expect(adapter.writeDeviceSetting(setting, '{"mine":true}', signal)).rejects.toBeInstanceOf(SyntaxError);
+    expect(prompt).toHaveBeenCalledOnce();
+    expect(fake.spies.writeBinary).toHaveBeenCalledOnce();
+    expect(fake.files[remote].data.toString()).toBe('{"theirs":true}');
+  });
+
   it.each(['cancel', 'keep-theirs'] as const)('leaves the requested settings bytes uncommitted on %s', async decision => {
     const { adapter, fake, remote, setting, signal } = await settingsConflict(async () => ({ decision }));
     await expect(adapter.writeDeviceSetting(setting, '{"mine":true}', signal)).rejects.toMatchObject({ code: -32020 });
@@ -1696,7 +1707,7 @@ describe('SftpDataAdapter — config write-through to the local shadow disk (#34
   });
 
   it('cannot publish an old settings conflict decision to the rebound transport', async () => {
-    const decision = Promise.withResolvers<TextConflictDecision>();
+    const decision = deferred<TextConflictDecision>();
     const modal = vi.fn(() => decision.promise);
     const { adapter, fake, setting, signal } = await settingsConflict(modal);
     const next = makeFakeClient();
@@ -1897,4 +1908,59 @@ describe('SftpDataAdapter — the materialised cache and the config tree', () =>
     expect(adapter.materializeSync('.obsidian/plugins/x/main.js')).toBe(false);
     expect([...owned]).toEqual([]);
   });
+});
+
+it('dispatches current settings after rebind while an obsolete conflict prompt is unanswered', async () => {
+  vi.useFakeTimers();
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'settings-recovery-'));
+  const configDir = '.obsidian';
+  const local = path.join(dir, 'app.json');
+  const setting = `${configDir}/app.json`;
+  const remote = '/vault/.obsidian/user/host-a/app.json';
+  const remoteFile = { data: Buffer.from('{"from":"remote"}'), mtime: 1 };
+  const old = makeFakeClient({ files: { [remote]: remoteFile } });
+  const next = makeFakeClient({ files: { [remote]: remoteFile } });
+  const cache = new ReadCache({ maxBytes: 4096 });
+  const ancestors = new AncestorTracker();
+  const oldDecision = deferred<TextConflictDecision>();
+  const prompt = vi.fn(() => oldDecision.promise);
+  const adapter = new SftpDataAdapter(
+    old.client, '/vault', cache, new DirCache({ ttlMs: 10_000 }), 'v',
+    new PathMapper('host-a', configDir), null,
+    new ConflictResolver(old.client, cache, ancestors, prompt, null), ancestors,
+  );
+  let change!: (file: string) => void;
+  const sync = new DeviceSettingsSync({
+    localConfigDir: dir, remoteConfigDir: configDir, remote: adapter,
+    watch: (callback) => { change = callback; return { close() {} }; },
+  });
+  try {
+    await adapter.readDeviceSetting(setting, new AbortController().signal);
+    old.spies.writeBinary.mockRejectedValueOnce(Object.assign(new Error('changed'), { code: -32020 }));
+    sync.startWatching();
+    await fs.writeFile(local, '{"edit":1}');
+    change('app.json');
+    await vi.advanceTimersByTimeAsync(1500);
+    expect(prompt).toHaveBeenCalledOnce();
+
+    sync.pause();
+    adapter.setReconnecting(true);
+    adapter.swapClient(next.client, '/vault');
+    adapter.setReconnecting(false);
+    await fs.writeFile(local, '{"edit":2}');
+    change('app.json');
+    sync.resume();
+    await vi.advanceTimersByTimeAsync(3000);
+    expect(next.spies.writeBinary).toHaveBeenCalledOnce();
+    expect(next.files[remote].data.toString()).toBe('{"edit":2}');
+    oldDecision.resolve({ decision: 'keep-mine' });
+    await vi.advanceTimersByTimeAsync(1500);
+    expect(old.spies.writeBinary).toHaveBeenCalledOnce();
+    expect(next.spies.writeBinary).toHaveBeenCalledOnce();
+  } finally {
+    sync.stop();
+    oldDecision.resolve({ decision: 'cancel' });
+    vi.useRealTimers();
+    await fs.rm(dir, { recursive: true, force: true });
+  }
 });
