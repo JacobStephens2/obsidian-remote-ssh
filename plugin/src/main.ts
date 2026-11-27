@@ -10,6 +10,7 @@ import { KbdInteractiveModal } from './ui/KbdInteractiveModal';
 import { HostKeyMismatchModal } from './ui/HostKeyMismatchModal';
 import { PendingEditsBar } from './ui/PendingEditsBar';
 import { RpcRemoteFsClient } from './adapter/RpcRemoteFsClient';
+import { readRemoteFileIfPresent } from './adapter/RemoteFsClient';
 import { AdapterManager } from './adapter/AdapterManager';
 import type { SftpDataAdapter } from './adapter/SftpDataAdapter';
 import { establishRpcConnection } from './transport/RpcConnection';
@@ -28,8 +29,8 @@ import { VaultPopulation, type PopulationProgress } from './vault/VaultPopulatio
 import { RenameLeafFollower } from './vault/RenameLeafFollower';
 import { ObsidianRegistry } from './shadow/ObsidianRegistry';
 import { ShadowVaultBootstrap } from './shadow/ShadowVaultBootstrap';
-import type { SharedConfigReader, BootstrapResult } from './shadow/ShadowVaultBootstrap';
-import { SharedConfigWatcher } from './shadow/SharedConfigWatcher';
+import type { ConfigReader, BootstrapResult } from './shadow/ShadowVaultBootstrap';
+import { DeviceSettingsSync, stageDeviceSettings } from './shadow/DeviceSettingsSync';
 import { ShadowVaultManager } from './shadow/ShadowVaultManager';
 import { WindowSpawner } from './shadow/WindowSpawner';
 import { ShadowStartupCoordinator } from './shadow/ShadowStartupCoordinator';
@@ -110,11 +111,12 @@ export default class RemoteSshPlugin extends Plugin {
   private fsChangeListener!: FsChangeListener;
   /**
    * #342 push half: watches the shadow vault's local config dir and
-   * pushes shared-config edits to the remote. Lives only for the
+   * backs up per-device Obsidian settings. Lives only for the
    * duration of a connected session (started after the connect pull,
    * stopped on disconnect/unload).
    */
-  private sharedConfigWatcher: SharedConfigWatcher | null = null;
+  private deviceSettings: DeviceSettingsSync | null = null;
+  private settingsRecovery: object | null = null;
   private observability: ObservabilityInstaller | null = null;
   /**
    * #149 — re-entrant guard for `openRemoteTerminal()`. The
@@ -365,7 +367,7 @@ export default class RemoteSshPlugin extends Plugin {
    * connect half without re-fetching anything.
    */
   private async runShadowStartup(): Promise<void> {
-    const attempt = this.stopPopulation();
+    const attempt = this.replaceStartup();
     const coordinator = new ShadowStartupCoordinator(
       this.app, this.settings, () => this.saveSettings(),
     );
@@ -565,7 +567,7 @@ export default class RemoteSshPlugin extends Plugin {
    * run came from the layout-ready hook or a manual reconnect.
    */
   private async runAutoConnect(
-    tag: 'layout-ready' | 'reconnect', attempt = this.stopPopulation(),
+    tag: 'layout-ready' | 'reconnect', attempt = this.replaceStartup(),
   ): Promise<void> {
     const profileId = this.settings.autoConnectProfileId;
     if (!profileId) return;
@@ -594,7 +596,7 @@ export default class RemoteSshPlugin extends Plugin {
       const teardown = this.startupRevision;
       await plannedDisconnect.catch(() => {});
       if (teardown !== this.startupRevision) return;
-      attempt = this.stopPopulation();
+      attempt = this.replaceStartup();
     }
 
     logger.info(`runAutoConnect(${tag}): connecting to profile ${profile.name}`);
@@ -623,12 +625,6 @@ export default class RemoteSshPlugin extends Plugin {
       return;
     }
 
-    // Pull this device's Obsidian config (app.json / appearance.json /
-    // core-plugins.json / hotkeys.json — now per-client via PathMapper)
-    // from the remote onto the local shadow disk *before* the populate, so
-    // the next time this window restarts Obsidian reads fresh settings
-    // instead of the stale local copy (#342). Best-effort: a failure here
-    // must not block rendering the vault.
     const isCurrent = () => attempt === this.startupRevision && this.adapterMgr.dataAdapter === da;
     const hostAdapter = this.app.vault.adapter;
     if (hostAdapter instanceof FileSystemAdapter) {
@@ -636,36 +632,29 @@ export default class RemoteSshPlugin extends Plugin {
         hostAdapter.getBasePath(), this.app.vault.configDir,
       );
       const remoteConfigDir = this.app.vault.configDir;
-      try {
-        const cfg = await ShadowVaultBootstrap.pullSharedObsidianConfig(
-          da, remoteConfigDir, localConfigDir,
-        );
-        if (!isCurrent()) return;
-        if (cfg.errored.length > 0) {
-          // The connection is up but some shared-config files the
-          // remote *had* couldn't be pulled (transient SSH error /
-          // corrupt file). Without a signal the user would just see
-          // settings silently not update — the #342 symptom. Absent
-          // files are not errored, so a fresh vault stays quiet.
-          new Notice(
-            `Remote SSH: ${cfg.errored.length} config file` +
-            `${cfg.errored.length === 1 ? '' : 's'} (${cfg.errored.join(', ')}) ` +
-            'could not be synced — settings may be stale until the next connect',
-          );
-        }
-      } catch (e) {
-        if (!isCurrent()) return;
-        logger.warn(
-          `runAutoConnect(${tag}): shared-config pull failed: ${errorMessage(e)}`,
-        );
-      }
+      const deviceSettings = new DeviceSettingsSync({
+        localConfigDir,
+        remoteConfigDir,
+        remote: da,
+        diagnose: ({ operation, files }) => {
+          const detail = operation === 'pull'
+            ? 'could not be synced — settings may be stale until the next connect'
+            : 'could not be pushed — settings change not yet saved remotely';
+          new Notice(`Remote SSH: ${files.length} config file${files.length === 1 ? '' : 's'}` +
+            ` (${files.join(', ')}) ${detail}`);
+        },
+      });
+      this.deviceSettings = deviceSettings;
+      if (this.settingsRecovery) deviceSettings.pause();
+      await deviceSettings.pull();
+      if (!isCurrent()) return;
 
       // #429 / #342 residual: round-trip the enabled community-plugins
       // list. Pull first so plugins set up on the remote load in the
       // shadow vault (the marketplace installer then fetches any missing
       // binaries); then push the converged result so a plugin enabled —
       // or UNINSTALLED — only here reaches the remote for other machines.
-      // Kept out of the verbatim shared-config set because `remote-ssh`
+      // The enabled list has its own round-trip because `remote-ssh`
       // must be force-preserved through the merge (a verbatim copy of a
       // remote list omitting it would disable this very plugin).
       //
@@ -720,52 +709,7 @@ export default class RemoteSshPlugin extends Plugin {
       }
       if (!isCurrent()) return;
 
-      // #342 push half: pull only brought remote→local. Without this,
-      // a settings change made HERE never reaches the remote, so the
-      // next session's pull finds nothing and the change evaporates.
-      // Watch the local config dir and push divergent shared files.
-      this.sharedConfigWatcher?.stop();
-      const watcher = new SharedConfigWatcher({
-        watch: (onChange) => {
-          const w = fs.watch(
-            localConfigDir, { persistent: false },
-            (_evt, filename) => onChange(filename ? String(filename) : null),
-          );
-          return { close: () => w.close() };
-        },
-        readLocal: (b) => {
-          try { return fs.readFileSync(path.join(localConfigDir, b), 'utf-8'); }
-          catch { return null; }
-        },
-        flush: async () => {
-          const r = await ShadowVaultBootstrap.pushSharedObsidianConfig(
-            da, remoteConfigDir, localConfigDir,
-          );
-          if (r.errored.length > 0) {
-            new Notice(
-              `Remote SSH: ${r.errored.length} config file` +
-              `${r.errored.length === 1 ? '' : 's'} (${r.errored.join(', ')}) ` +
-              'could not be pushed — settings change not yet saved remotely',
-            );
-          }
-        },
-        debounceMs: 1500,
-        setTimer: (cb, ms) => window.setTimeout(cb, ms),
-        clearTimer: (h) => window.clearTimeout(h as number),
-      });
-      // Seed the just-pulled bytes as the synced baseline so the
-      // pull's own writes (and Obsidian re-saving an identical file
-      // on open) don't immediately echo back to the remote.
-      for (const base of ShadowVaultBootstrap.SHARED_OBSIDIAN_CONFIG_FILES) {
-        try {
-          watcher.markSynced(
-            base, fs.readFileSync(path.join(localConfigDir, base), 'utf-8'),
-          );
-        } catch { /* absent locally — nothing to baseline */ }
-      }
-      watcher.start();
-      this.sharedConfigWatcher = watcher;
-
+      deviceSettings.startWatching();
     }
 
     const population = new VaultPopulation({
@@ -829,6 +773,8 @@ export default class RemoteSshPlugin extends Plugin {
     }
     const run = { adapter: this.adapterMgr.dataAdapter };
     this.reconnectRun = run;
+    this.settingsRecovery = run;
+    this.deviceSettings?.pause();
     const currentAdapter = () => {
       if (this.reconnectRun !== run) return null;
       // Initial patching may still be waiting on the bridge or offline queue.
@@ -895,7 +841,8 @@ export default class RemoteSshPlugin extends Plugin {
       // forget: the user's already-back state is independent of the
       // replay outcome, and individual op failures stay in the queue
       // for the next reconnect.
-      if (da) void this.adapterMgr.replayOfflineQueue('after-reconnect');
+      if (da) void this.replayAfterReconnect(da, this.settingsRecovery);
+      else this.settingsRecovery = null;
     } else if (s.kind === 'failed') {
       // Give up: tear the patched adapter down so Obsidian falls
       // back to local file:// reads instead of blocking forever on a
@@ -996,8 +943,11 @@ export default class RemoteSshPlugin extends Plugin {
   private disconnecting: Promise<void> | null = null;
   private reconnectRun: object | null = null;
 
-  private stopPopulation(): number {
+  private replaceStartup(): number {
     this.startupRevision++;
+    this.deviceSettings?.stop();
+    this.deviceSettings = null;
+    this.settingsRecovery = null;
     this.population?.stop();
     this.population = null;
     return this.startupRevision;
@@ -1005,12 +955,20 @@ export default class RemoteSshPlugin extends Plugin {
 
   private restoreAdapter(): void {
     const hadPopulation = this.population !== null;
-    this.stopPopulation();
-    // The config watcher pushes through the adapter being restored.
-    this.sharedConfigWatcher?.stop();
-    this.sharedConfigWatcher = null;
+    this.replaceStartup();
     this.adapterMgr.restore();
     if (hadPopulation && this.state === SyncState.CONNECTED) this.statusBar?.update(this.state);
+  }
+
+  private async replayAfterReconnect(da: SftpDataAdapter, recovery: object | null): Promise<void> {
+    try {
+      await this.adapterMgr.replayOfflineQueue('after-reconnect');
+    } catch (e) {
+      logger.warn(`Offline replay after reconnect: ${errorMessage(e)}`);
+    }
+    if (this.settingsRecovery !== recovery || this.adapterMgr.dataAdapter !== da || da.isReconnecting()) return;
+    this.settingsRecovery = null;
+    this.deviceSettings?.resume();
   }
 
   private resumePopulation(da: SftpDataAdapter): void {
@@ -1176,7 +1134,7 @@ export default class RemoteSshPlugin extends Plugin {
 
   /**
    * Pre-spawn pull (#429b / Phase B-3). Before the shadow window opens,
-   * pull the remote `.obsidian/` — shared config (#342), the enabled-
+   * pull the remote config directory — per-device settings (#342), the enabled-
    * plugins list, and plugin binaries (#429b) — into the freshly
    * bootstrapped shadow dir, so the window boots on the CANONICAL remote
    * config instead of a stale local copy (no mid-session settings reload).
@@ -1193,7 +1151,7 @@ export default class RemoteSshPlugin extends Plugin {
    */
   private async preSpawnPull(profile: SshProfile, result: BootstrapResult): Promise<void> {
     const localConfigDir = result.layout.configDir;
-    const remoteConfigDir = this.app.vault.configDir; // ".obsidian"
+    const remoteConfigDir = this.app.vault.configDir;
     const remoteBase = normalizeRemotePath(profile.remotePath);
     // Apply the SAME per-client redirect the shadow window's adapter will use
     // (AdapterManager builds `new PathMapper(resolveClientId(settings), configDir)`),
@@ -1203,7 +1161,7 @@ export default class RemoteSshPlugin extends Plugin {
     // clobbered the per-device config on every spawn, undoing the redirect.
     // `PathMapper.toRemote` is identity for non-private paths (community-plugins.json,
     // plugins/…), so those still round-trip shared, unchanged.
-    const mapper = new PathMapper(ConnectionManager.resolveClientId(this.settings), remoteConfigDir);
+    const mapper = new PathMapper(ConnectionManager.resolveClientId(result), remoteConfigDir);
     const toRemote = (p: string): string => preSpawnRemotePath(mapper, remoteBase, p);
 
     const client = new SftpClient(
@@ -1212,23 +1170,22 @@ export default class RemoteSshPlugin extends Plugin {
       () => Promise.reject(new Error('pre-spawn: keyboard-interactive deferred to shadow window')),
       () => Promise.reject(new Error('pre-spawn: host-key prompt deferred to shadow window')),
     );
-    const reader: SharedConfigReader = {
+    const reader: ConfigReader = {
       exists: (p) => client.exists(toRemote(p)),
       read: (p) => client.readText(toRemote(p)),
     };
     // Bound the whole connect+pull so a slow link can't stall the window
     // open — beyond the budget we fall back to spawn-and-catch-up.
     const budgetMs = (profile.connectTimeoutMs || 15_000) + 8_000;
-    // Run as a standalone promise: if the budget fires first, `finally`
-    // disconnects the client and any read still in flight then throws
-    // "not connected". That settles `pull` a SECOND time, after the race
-    // already lost — an unhandledrejection in the renderer unless we keep
-    // a handler on it. The real-error diagnostics still flow through the
-    // `withTimeout` race into the catch below; this handler only mops up
-    // the expected post-disconnect noise.
+    const controller = new AbortController();
+    const { signal } = controller;
     const pull = (async () => {
       await client.connect(profile);
-      await ShadowVaultBootstrap.pullSharedObsidianConfig(reader, remoteConfigDir, localConfigDir);
+      if (signal.aborted) return;
+      await stageDeviceSettings({ remoteConfigDir, localConfigDir }, {
+        readDeviceSetting: (p) => readRemoteFileIfPresent(() => reader.read(p)),
+      }, signal);
+      if (signal.aborted) return;
       // Same base as the shadow window's own round-trip will use (same
       // device, same profile), so a removal another machine made is
       // applied here too and the window boots on the converged list.
@@ -1241,13 +1198,13 @@ export default class RemoteSshPlugin extends Plugin {
         reader, remoteConfigDir, localConfigDir,
         ShadowVaultBootstrap.communityPluginsBasePath(shadowStateRoot(), profile.id),
       );
+      if (signal.aborted) return;
       const enabledIds = ShadowVaultBootstrap.readEnabledPluginIds(localConfigDir);
       await ShadowVaultBootstrap.pullPluginBinaries(reader, remoteConfigDir, localConfigDir, enabledIds);
     })();
-    pull.catch(() => { /* post-timeout teardown error — handled via the race */ });
     try {
-      await withTimeout(pull, budgetMs, 'pre-spawn pull');
-      logger.info(`preSpawnPull: staged canonical .obsidian/ before spawn (${profile.name})`);
+      await withTimeout(pull, budgetMs, 'pre-spawn pull', () => controller.abort());
+      logger.info(`preSpawnPull: staged remote config before spawn (${profile.name})`);
     } catch (e) {
       logger.warn(`preSpawnPull: skipped (${errorMessage(e)}); shadow window will sync after open`);
     } finally {

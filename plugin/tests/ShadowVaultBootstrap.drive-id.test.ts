@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import type { SharedConfigReader } from '../src/shadow/ShadowVaultBootstrap';
+import type { ConfigReader } from '../src/shadow/ShadowVaultBootstrap';
 
 // Windows `path.resolve(root, id)` re-parses a second argument. The id
 // `C:remote-ssh` is drive-relative on the same drive as `root` and
@@ -48,7 +48,7 @@ describe('pullPluginBinaries drive-relative plugin id', () => {
     const touched: string[] = [];
     (globalThis as { __driveIdTouched?: string[] }).__driveIdTouched = touched;
 
-    const reader: SharedConfigReader = {
+    const reader: ConfigReader = {
       exists: () => Promise.resolve(true),
       read: (p) => Promise.resolve(
         p.endsWith('manifest.json')

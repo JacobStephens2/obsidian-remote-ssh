@@ -1,4 +1,5 @@
 import type { RemoteEntry, RemoteStat } from '../types';
+import { ErrorCode } from '../proto/types';
 
 /**
  * The surface `SftpDataAdapter` (and friends) need from whatever is
@@ -41,10 +42,10 @@ export interface RemoteFsClient {
    * argument; conflict detection is a best-effort feature, not a
    * correctness invariant.
    */
-  writeBinary(path: string, data: Buffer, expectedMtime?: number): Promise<void>;
+  writeBinary(path: string, data: Buffer, expectedMtime?: number, checkConnected?: () => void): Promise<void>;
 
   /** Ensure a directory chain exists (idempotent). */
-  mkdirp(path: string): Promise<void>;
+  mkdirp(path: string, checkConnected?: () => void): Promise<void>;
 
   /** File-only remove. Directories must go through `rmdir`. */
   remove(path: string): Promise<void>;
@@ -56,3 +57,15 @@ export interface RemoteFsClient {
 
 /** Called with `{unexpected:true}` when the connection dropped without a clean disconnect. */
 export type CloseListener = (info: { unexpected: boolean }) => void;
+
+/** A missing file is normal during a settings pull. Other read errors must reach the caller. */
+export async function readRemoteFileIfPresent<T>(read: () => Promise<T>): Promise<T | null> {
+  try {
+    return await read();
+  } catch (e) {
+    // SFTP SSH_FX_NO_SUCH_FILE and the daemon's equivalent.
+    if (typeof e === 'object' && e !== null && 'code' in e &&
+        (e.code === 2 || e.code === ErrorCode.FileNotFound)) return null;
+    throw e;
+  }
+}

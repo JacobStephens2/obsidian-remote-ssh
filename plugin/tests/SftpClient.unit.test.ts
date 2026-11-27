@@ -348,6 +348,22 @@ describe('SftpClient.readBinary() / readText()', () => {
 // ─── writeBinary (atomicWrite) ────────────────────────────────────────────────
 
 describe('SftpClient.writeBinary() — atomic write', () => {
+  it('does not rename a staged file when the connected settings request is cancelled', async () => {
+    const sut = makeSut();
+    const sftp = makeSftp();
+    const controller = new AbortController();
+    sftp.writeFile.mockImplementation((_p: string, _d: Buffer, cb: (error: null) => void) => {
+      controller.abort();
+      cb(null);
+    });
+    wire(sut, sftp);
+
+    await expect(sut.writeBinary('config/app.json', Buffer.from('{}'), () => controller.signal.throwIfAborted()))
+      .rejects.toMatchObject({ name: 'AbortError' });
+    expect(sftp.rename).not.toHaveBeenCalled();
+    expect(sftp.unlink).not.toHaveBeenCalled();
+  });
+
   it('success: calls writeFile on tmp path then rename to final path', async () => {
     const sut  = makeSut();
     const sftp = makeSftp();
@@ -538,6 +554,22 @@ describe('SftpClient.mkdir()', () => {
 // ─── mkdirp ──────────────────────────────────────────────────────────────────
 
 describe('SftpClient.mkdirp()', () => {
+  it('does not continue creating directories when a settings request is cancelled during stat', async () => {
+    const sut = makeSut();
+    const sftp = makeSftp();
+    const controller = new AbortController();
+    sftp.stat.mockImplementation((_p: string, cb: (error: Error) => void) => {
+      controller.abort();
+      cb(new Error('missing'));
+    });
+    wire(sut, sftp);
+
+    await expect(sut.mkdirp('/a/b/c', () => controller.signal.throwIfAborted()))
+      .rejects.toMatchObject({ name: 'AbortError' });
+    expect(sftp.stat).toHaveBeenCalledOnce();
+    expect(sftp.mkdir).not.toHaveBeenCalled();
+  });
+
   it('creates each segment of an absolute path', async () => {
     const sut  = makeSut();
     const sftp = makeSftp();

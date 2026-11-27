@@ -41,16 +41,16 @@ export class SftpRemoteFsClient implements RemoteFsClient {
     return this.client.readBinary(path);
   }
 
-  writeBinary(path: string, data: Buffer, _expectedMtime?: number): Promise<void> {
+  writeBinary(path: string, data: Buffer, _expectedMtime?: number, checkConnected?: () => void): Promise<void> {
     // SFTP has no atomic precondition surface — there's no way to ask
     // the server "only write if mtime equals N" without a roundtrip
     // race. We accept the argument for interface parity but ignore
     // it; conflict detection is RPC-only.
-    return this.client.writeBinary(path, data);
+    return checkConnected ? this.client.writeBinary(path, data, checkConnected) : this.client.writeBinary(path, data);
   }
 
-  mkdirp(path: string): Promise<void> {
-    return this.client.mkdirp(path);
+  mkdirp(path: string, checkConnected?: () => void): Promise<void> {
+    return checkConnected ? this.client.mkdirp(path, checkConnected) : this.client.mkdirp(path);
   }
 
   remove(path: string): Promise<void> {

@@ -4,7 +4,7 @@ import { ReadCache } from '../src/cache/ReadCache';
 import { DirCache } from '../src/cache/DirCache';
 import { PathMapper } from '../src/path/PathMapper';
 import { AncestorTracker } from '../src/conflict/AncestorTracker';
-import { ConflictResolver } from '../src/conflict/ConflictResolver';
+import { ConflictResolver, type TextConflictDecision } from '../src/conflict/ConflictResolver';
 import { OfflineQueue } from '../src/offline/OfflineQueue';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
@@ -1637,6 +1637,96 @@ describe('SftpDataAdapter — config write-through to the local shadow disk (#34
 
     expect(await fs.readFile(path.join(shadow, '.obsidian', 'app.json'), 'utf-8'))
       .toBe('{"promptDelete":false}');
+  });
+
+  it('acknowledges a connected settings snapshot without mirroring over a later local save', async () => {
+    const fake = makeFakeClient();
+    const local = path.join(shadow, 'custom-config', 'app.json');
+    const remote = '/srv/vault/custom-config/user/host-a/app.json';
+    const submitted = '{ "theme": "dark" }\n';
+    const newer = '{ "theme": "light" }\n';
+    const adapter = new SftpDataAdapter(
+      fake.client, '/srv/vault', readCache, dirCache, 'v',
+      new PathMapper('host-a', 'custom-config'), null, null, null, null, shadow,
+    );
+    await fs.mkdir(path.dirname(local));
+    await fs.writeFile(local, submitted);
+    fake.spies.writeBinary.mockImplementationOnce(async (file, bytes) => {
+      fake.files[file] = { data: bytes, mtime: 1001 };
+      await fs.writeFile(local, newer);
+    });
+    fake.spies.stat.mockRejectedValueOnce(new Error('stat unavailable'));
+
+    await expect(adapter.writeDeviceSetting('custom-config/app.json', submitted, new AbortController().signal))
+      .resolves.toBe(submitted);
+    expect(fake.files[remote].data.toString()).toBe(submitted);
+    expect(await fs.readFile(local, 'utf8')).toBe(newer);
+  });
+
+  async function settingsConflict(onText: () => Promise<TextConflictDecision>) {
+    const setting = 'custom-config/app.json';
+    const remote = '/srv/vault/custom-config/user/host-a/app.json';
+    const tracker = new AncestorTracker();
+    const fake = makeFakeClient({ files: { [remote]: { data: Buffer.from('{"origin":true}'), mtime: 1 } } });
+    const adapter = new SftpDataAdapter(
+      fake.client, '/srv/vault', readCache, dirCache, 'v',
+      new PathMapper('host-a', 'custom-config'), null,
+      new ConflictResolver(fake.client, readCache, tracker, onText, null), tracker,
+    );
+    const { signal } = new AbortController();
+    await adapter.readDeviceSetting(setting, signal);
+    fake.files[remote] = { data: Buffer.from('{"theirs":true}'), mtime: 2 };
+    fake.spies.writeBinary.mockRejectedValueOnce(Object.assign(new Error('remote changed'), { code: -32020 }));
+    return { adapter, fake, remote, setting, signal };
+  }
+
+  it('acknowledges the exact approved settings merge even when stat after commit fails', async () => {
+    const merged = '{\r\n  "mine": true, "theirs" : true\r\n}\r\n';
+    const { adapter, fake, remote, setting, signal } = await settingsConflict(async () => ({ decision: 'merged', content: merged }));
+    fake.spies.stat.mockRejectedValueOnce(new Error('stat unavailable'));
+    await expect(adapter.writeDeviceSetting(setting, '{"mine":true}', signal)).resolves.toBe(merged);
+    expect(fake.files[remote].data.toString()).toBe(merged);
+  });
+
+  it.each(['cancel', 'keep-theirs'] as const)('leaves the requested settings bytes uncommitted on %s', async decision => {
+    const { adapter, fake, remote, setting, signal } = await settingsConflict(async () => ({ decision }));
+    await expect(adapter.writeDeviceSetting(setting, '{"mine":true}', signal)).rejects.toMatchObject({ code: -32020 });
+    expect(fake.spies.writeBinary).toHaveBeenCalledOnce();
+    expect(fake.files[remote].data.toString()).toBe('{"theirs":true}');
+  });
+
+  it('cannot publish an old settings conflict decision to the rebound transport', async () => {
+    const decision = Promise.withResolvers<TextConflictDecision>();
+    const modal = vi.fn(() => decision.promise);
+    const { adapter, fake, setting, signal } = await settingsConflict(modal);
+    const next = makeFakeClient();
+    const sending = adapter.writeDeviceSetting(setting, '{"mine":true}', signal);
+    const outcome = expect(sending).rejects.toThrow('reconnecting');
+    await vi.waitFor(() => expect(modal).toHaveBeenCalledOnce());
+
+    adapter.setReconnecting(true);
+    adapter.swapClient(next.client, '/new-root');
+    adapter.setReconnecting(false);
+    decision.resolve({ decision: 'merged', content: '{"obsolete":true}' });
+    await outcome;
+    expect(fake.spies.writeBinary).toHaveBeenCalledOnce();
+    expect(next.spies.writeBinary).not.toHaveBeenCalled();
+    expect(next.spies.stat).not.toHaveBeenCalled();
+  });
+
+  it('does not enqueue settings snapshots while ordinary text writes still queue', async () => {
+    const fake = makeFakeClient();
+    const queue = await OfflineQueue.open(path.join(shadow, 'queue'));
+    const adapter = new SftpDataAdapter(
+      fake.client, '/v', readCache, dirCache, 'v', new PathMapper('host-a'), null, null, null, queue,
+    );
+    adapter.setReconnecting(true);
+    await expect(adapter.writeDeviceSetting('.obsidian/app.json', '{}', new AbortController().signal))
+      .rejects.toThrow('reconnecting');
+    expect(queue.pending()).toHaveLength(0);
+    await adapter.write('note.md', 'queued');
+    expect(queue.pending()).toHaveLength(1);
+    expect(fake.spies.writeBinary).not.toHaveBeenCalled();
   });
 
   it('does NOT mirror ordinary vault notes — the note tree stays virtual', async () => {

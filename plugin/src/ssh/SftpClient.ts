@@ -531,8 +531,8 @@ export class SftpClient {
 
   // ─── write-side ──────────────────────────────────────────────────────────
 
-  async writeBinary(remotePath: string, data: Buffer): Promise<void> {
-    return this.atomicWrite(remotePath, data);
+  async writeBinary(remotePath: string, data: Buffer, checkConnected?: () => void): Promise<void> {
+    return this.atomicWrite(remotePath, data, checkConnected);
   }
 
   async writeText(remotePath: string, data: string, encoding: SftpEncoding = 'utf8'): Promise<void> {
@@ -540,15 +540,18 @@ export class SftpClient {
   }
 
   /** Best-effort overwrite via tmp file + atomic rename. Cleans up tmp on failure. */
-  private async atomicWrite(remotePath: string, data: Buffer): Promise<void> {
+  private async atomicWrite(remotePath: string, data: Buffer, checkConnected?: () => void): Promise<void> {
+    checkConnected?.();
     const sftp = this.requireSftp();
     const tmpPath = remotePath + TMP_SUFFIX;
     try {
       await new Promise<void>((resolve, reject) => {
         sftp.writeFile(tmpPath, data, err => err ? reject(asError(err)) : resolve());
       });
+      checkConnected?.();
       await this.rename(tmpPath, remotePath);
     } catch (e) {
+      checkConnected?.();
       try { await this.remove(tmpPath); } catch { /* ignore cleanup failure */ }
       throw e;
     }
@@ -592,7 +595,8 @@ export class SftpClient {
    * is in the way we surface the conflict; otherwise we mkdir and let
    * a real SFTP error bubble up.
    */
-  async mkdir(remotePath: string): Promise<void> {
+  async mkdir(remotePath: string, checkConnected?: () => void): Promise<void> {
+    checkConnected?.();
     const sftp = this.requireSftp();
     try {
       const s = await this.stat(remotePath);
@@ -602,6 +606,7 @@ export class SftpClient {
       // Treat any stat failure as "path is not there yet" and try to create it.
       if (errorMessage(e)?.startsWith('mkdir: ')) throw e;
     }
+    checkConnected?.();
     return new Promise((resolve, reject) => {
       sftp.mkdir(remotePath, err => {
         if (err && !err.message.toLowerCase().includes('exist')) reject(asError(err));
@@ -610,7 +615,7 @@ export class SftpClient {
     });
   }
 
-  async mkdirp(remotePath: string): Promise<void> {
+  async mkdirp(remotePath: string, checkConnected?: () => void): Promise<void> {
     const isAbs = remotePath.startsWith('/');
     const parts = remotePath.split('/').filter(Boolean);
     let current = '';
@@ -618,7 +623,7 @@ export class SftpClient {
       current = isAbs
         ? current + '/' + part
         : (current ? current + '/' + part : part);
-      await this.mkdir(current);
+      await this.mkdir(current, checkConnected);
     }
   }
 

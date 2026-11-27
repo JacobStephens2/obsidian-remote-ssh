@@ -1,5 +1,12 @@
 import * as os from 'os';
 
+export const DEVICE_SETTINGS_FILES = [
+  'app.json',
+  'appearance.json',
+  'core-plugins.json',
+  'hotkeys.json',
+] as const;
+
 /**
  * Default Obsidian config-directory name (`.obsidian`). We construct
  * the literal via concatenation so the source text never contains the
@@ -40,10 +47,7 @@ export const DEFAULT_PRIVATE_PATTERN_BASENAMES: readonly string[] = [
   // at the identity path, so every settings save tripped PreconditionFailed
   // against the other's mtime. Redirecting them makes a shared path — and
   // thus the conflict — impossible by construction.
-  'app.json',
-  'appearance.json',
-  'core-plugins.json',
-  'hotkeys.json',
+  ...DEVICE_SETTINGS_FILES,
   // Third-party plugin SETTINGS (#342 / #429) — per-device for exactly the
   // same reason as the four above. `Plugin.saveData()` fires on every
   // settings change, so a shared `<configDir>/plugins/<id>/data.json` would

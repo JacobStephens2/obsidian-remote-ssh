@@ -15,7 +15,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { ShadowVaultBootstrap } from '../src/shadow/ShadowVaultBootstrap';
-import type { SharedConfigReader, SharedConfigWriter } from '../src/shadow/ShadowVaultBootstrap';
+import type { ConfigReader, ConfigWriter } from '../src/shadow/ShadowVaultBootstrap';
 import { ObsidianRegistry } from '../src/shadow/ObsidianRegistry';
 import type { SshProfile, PendingPluginSuggestion } from '../src/types';
 
@@ -769,189 +769,6 @@ describe('ShadowVaultBootstrap: installPlugin symlink fallback', () => {
   });
 });
 
-// ─── pullSharedObsidianConfig (#342 shared-config round-trip) ─────────────────
-
-describe('ShadowVaultBootstrap.pullSharedObsidianConfig', () => {
-  let localConfigDir: string;
-
-  beforeEach(() => {
-    localConfigDir = path.join(
-      fs.mkdtempSync(path.join(os.tmpdir(), 'shadow-pull-')),
-      '.obsidian',
-    );
-  });
-
-  afterEach(() => {
-    try { fs.rmSync(path.dirname(localConfigDir), { recursive: true, force: true }); }
-    catch { /* best effort */ }
-  });
-
-  /**
-   * Build a fake SharedConfigReader from a per-basename spec.
-   * `content` → readable & valid; `'throw'` → read rejects;
-   * `'invalid'` → readable but not JSON; absent key → exists()=false.
-   */
-  function makeReader(spec: Record<string, string | 'throw' | 'invalid'>) {
-    const resolve = (p: string) => p.slice(p.lastIndexOf('/') + 1);
-    return {
-      exists: vi.fn(async (p: string) => resolve(p) in spec),
-      read: vi.fn(async (p: string) => {
-        const v = spec[resolve(p)];
-        if (v === 'throw') throw new Error('SSH read failed');
-        if (v === 'invalid') return '{ not json';
-        return v;
-      }),
-    };
-  }
-
-  it('pulls every present & valid file verbatim and reports them', async () => {
-    const reader = makeReader({
-      'app.json':          JSON.stringify({ useMarkdownLinks: false }),
-      'appearance.json':   JSON.stringify({ theme: 'obsidian' }),
-      'core-plugins.json': JSON.stringify(['file-explorer', 'search']),
-      'hotkeys.json':      JSON.stringify({ 'editor:toggle-bold': [] }),
-    });
-
-    const { pulled, skipped, errored } = await ShadowVaultBootstrap.pullSharedObsidianConfig(
-      reader, '.obsidian', localConfigDir,
-    );
-
-    expect(pulled.sort()).toEqual(
-      [...ShadowVaultBootstrap.SHARED_OBSIDIAN_CONFIG_FILES].sort(),
-    );
-    expect(skipped).toEqual([]);
-    expect(errored).toEqual([]);
-    expect(JSON.parse(fs.readFileSync(path.join(localConfigDir, 'app.json'), 'utf-8')))
-      .toEqual({ useMarkdownLinks: false });
-    // Atomic write must not leave a .tmp sibling behind.
-    expect(fs.readdirSync(localConfigDir).some(f => f.endsWith('.tmp'))).toBe(false);
-  });
-
-  it('creates localConfigDir when it does not exist yet', async () => {
-    expect(fs.existsSync(localConfigDir)).toBe(false);
-    await ShadowVaultBootstrap.pullSharedObsidianConfig(
-      makeReader({ 'app.json': '{}' }), '.obsidian', localConfigDir,
-    );
-    expect(fs.existsSync(localConfigDir)).toBe(true);
-  });
-
-  it('skips a file that is absent on the remote without writing it', async () => {
-    const { pulled, skipped, errored } = await ShadowVaultBootstrap.pullSharedObsidianConfig(
-      makeReader({ 'appearance.json': '{}' }), '.obsidian', localConfigDir,
-    );
-    expect(pulled).toEqual(['appearance.json']);
-    expect(skipped).toContain('app.json');
-    // Absent-on-remote is a benign skip, NOT an error (no Notice).
-    expect(errored).not.toContain('app.json');
-    expect(fs.existsSync(path.join(localConfigDir, 'app.json'))).toBe(false);
-  });
-
-  it('skips a file whose read throws but still processes the rest', async () => {
-    const { pulled, skipped, errored } = await ShadowVaultBootstrap.pullSharedObsidianConfig(
-      makeReader({ 'app.json': 'throw', 'hotkeys.json': '{}' }),
-      '.obsidian', localConfigDir,
-    );
-    expect(skipped).toContain('app.json');
-    expect(errored).toContain('app.json'); // a read throw is an error, surfaces a Notice
-    expect(pulled).toContain('hotkeys.json'); // loop didn't abort
-  });
-
-  it('skips a corrupt remote file and leaves the prior local copy intact', async () => {
-    fs.mkdirSync(localConfigDir, { recursive: true });
-    const healthy = JSON.stringify({ theme: 'keepme' });
-    fs.writeFileSync(path.join(localConfigDir, 'app.json'), healthy, 'utf-8');
-
-    const { skipped, errored } = await ShadowVaultBootstrap.pullSharedObsidianConfig(
-      makeReader({ 'app.json': 'invalid' }), '.obsidian', localConfigDir,
-    );
-
-    expect(skipped).toContain('app.json');
-    expect(errored).toContain('app.json'); // corrupt remote → surfaces a Notice
-    expect(fs.readFileSync(path.join(localConfigDir, 'app.json'), 'utf-8'))
-      .toBe(healthy); // NOT clobbered with broken JSON
-  });
-});
-
-// ─── pushSharedObsidianConfig (#342 round-trip: local → remote) ───────────────
-
-describe('ShadowVaultBootstrap.pushSharedObsidianConfig', () => {
-  let localConfigDir: string;
-
-  beforeEach(() => {
-    localConfigDir = path.join(
-      fs.mkdtempSync(path.join(os.tmpdir(), 'shadow-push-')),
-      '.obsidian',
-    );
-    fs.mkdirSync(localConfigDir, { recursive: true });
-  });
-  afterEach(() => {
-    try { fs.rmSync(path.dirname(localConfigDir), { recursive: true, force: true }); }
-    catch { /* best effort */ }
-  });
-
-  /** Writer that records calls; `failOn` rejects for that basename. */
-  function makeWriter(failOn?: string) {
-    const writes: Record<string, string> = {};
-    return {
-      writes,
-      write: vi.fn(async (p: string, content: string) => {
-        const base = p.slice(p.lastIndexOf('/') + 1);
-        if (base === failOn) throw new Error('SSH write failed');
-        writes[base] = content;
-      }),
-    };
-  }
-
-  it('pushes every present & valid local file verbatim', async () => {
-    const appBody = JSON.stringify({ useMarkdownLinks: false });
-    fs.writeFileSync(path.join(localConfigDir, 'app.json'), appBody, 'utf-8');
-    fs.writeFileSync(path.join(localConfigDir, 'hotkeys.json'), '{}', 'utf-8');
-    const w = makeWriter();
-
-    const { pushed, skipped, errored } =
-      await ShadowVaultBootstrap.pushSharedObsidianConfig(w, '.obsidian', localConfigDir);
-
-    expect(pushed.sort()).toEqual(['app.json', 'hotkeys.json']);
-    expect(errored).toEqual([]);
-    expect(skipped.sort()).toEqual(['appearance.json', 'core-plugins.json']); // absent locally
-    expect(w.writes['app.json']).toBe(appBody); // verbatim, not re-serialised
-    expect(w.write).toHaveBeenCalledWith('.obsidian/app.json', appBody);
-  });
-
-  it('skips files absent locally (fresh vault — not an error)', async () => {
-    const w = makeWriter();
-    const { pushed, errored } =
-      await ShadowVaultBootstrap.pushSharedObsidianConfig(w, '.obsidian', localConfigDir);
-    expect(pushed).toEqual([]);
-    expect(errored).toEqual([]);
-    expect(w.write).not.toHaveBeenCalled();
-  });
-
-  it('does NOT push a half-written (invalid JSON) local file', async () => {
-    fs.writeFileSync(path.join(localConfigDir, 'app.json'), '{ not json', 'utf-8');
-    const w = makeWriter();
-
-    const { pushed, skipped, errored } =
-      await ShadowVaultBootstrap.pushSharedObsidianConfig(w, '.obsidian', localConfigDir);
-
-    expect(pushed).not.toContain('app.json');
-    expect(skipped).toContain('app.json');
-    expect(errored).toContain('app.json'); // surfaces — settings not silently lost
-    expect(w.write).not.toHaveBeenCalledWith('.obsidian/app.json', expect.anything());
-  });
-
-  it('reports a failed remote write as errored (not silently dropped)', async () => {
-    fs.writeFileSync(path.join(localConfigDir, 'app.json'), '{"a":1}', 'utf-8');
-    const w = makeWriter('app.json');
-
-    const { pushed, errored } =
-      await ShadowVaultBootstrap.pushSharedObsidianConfig(w, '.obsidian', localConfigDir);
-
-    expect(pushed).not.toContain('app.json');
-    expect(errored).toContain('app.json');
-  });
-});
-
 // ─── first-run state seeding (first-open deadlock fix) ───────────────────────
 
 describe('ShadowVaultBootstrap — seedObsidianFirstRunState', () => {
@@ -1041,7 +858,7 @@ describe('ShadowVaultBootstrap — seedObsidianFirstRunState', () => {
     expect(fs.statSync(appPath).isDirectory()).toBe(true);
   });
 
-  it('does NOT clobber a real app.json (left by pullSharedObsidianConfig / Obsidian)', async () => {
+  it('does NOT clobber a real app.json (left by settings sync or Obsidian)', async () => {
     const r = new ShadowVaultBootstrap(scratch.baseDir, scratch.sourceDir, new ObsidianRegistry(scratch.configPath));
     const profile = makeProfile({ id: 'p1' });
     const result = await r.bootstrap(profile, [profile]);
@@ -1071,7 +888,7 @@ describe('ShadowVaultBootstrap — seedObsidianFirstRunState', () => {
 // ─── community-plugins round-trip (#429 / #342 residual) ────────────────
 //
 // app/appearance/core-plugins/hotkeys already round-trip via
-// pull/pushSharedObsidianConfig, but the *enabled community-plugins*
+// the per-device settings round-trip, but the *enabled community-plugins*
 // list does NOT: it is only ever seeded locally as ["remote-ssh"]
 // (see the bootstrap suite above). So a plugin enabled on machine A
 // never reaches machine B's shadow vault, and reopening the vault
@@ -1104,7 +921,7 @@ describe('ShadowVaultBootstrap community-plugins round-trip (#429 / #342)', () =
     const remote: Record<string, string> = {
       '.obsidian/community-plugins.json': JSON.stringify(['dataview', 'templater']),
     };
-    const reader: SharedConfigReader = {
+    const reader: ConfigReader = {
       exists: (p) => Promise.resolve(p in remote),
       read: (p) => Promise.resolve(remote[p]),
     };
@@ -1121,7 +938,7 @@ describe('ShadowVaultBootstrap community-plugins round-trip (#429 / #342)', () =
     const remote: Record<string, string> = {
       '.obsidian/community-plugins.json': JSON.stringify(['dataview']),
     };
-    const reader: SharedConfigReader = {
+    const reader: ConfigReader = {
       exists: (p) => Promise.resolve(p in remote),
       read: (p) => Promise.resolve(remote[p]),
     };
@@ -1135,7 +952,7 @@ describe('ShadowVaultBootstrap community-plugins round-trip (#429 / #342)', () =
 
   it('is a benign no-op when the remote has no community-plugins.json yet', async () => {
     const localConfigDir = makeLocalConfigDir(['remote-ssh']);
-    const reader: SharedConfigReader = {
+    const reader: ConfigReader = {
       exists: () => Promise.resolve(false),
       read: () => Promise.reject(new Error('must not read an absent file')),
     };
@@ -1151,7 +968,7 @@ describe('ShadowVaultBootstrap community-plugins round-trip (#429 / #342)', () =
     const remote: Record<string, string> = {
       '.obsidian/community-plugins.json': '{ this is : not json',
     };
-    const reader: SharedConfigReader = {
+    const reader: ConfigReader = {
       exists: (p) => Promise.resolve(p in remote),
       read: (p) => Promise.resolve(remote[p]),
     };
@@ -1168,7 +985,7 @@ describe('ShadowVaultBootstrap community-plugins round-trip (#429 / #342)', () =
     const remote: Record<string, string> = {
       '.obsidian/community-plugins.json': JSON.stringify(['dataview', '', '.', '..', '../escaped', 'win\\id', 'C:dataview']),
     };
-    const reader: SharedConfigReader = {
+    const reader: ConfigReader = {
       exists: (p) => Promise.resolve(p in remote),
       read: (p) => Promise.resolve(remote[p]),
     };
@@ -1183,12 +1000,12 @@ describe('ShadowVaultBootstrap community-plugins round-trip (#429 / #342)', () =
   // Reader+writer fake backed by an in-memory store. `read` can be made
   // to throw to simulate a transient SSH error mid-read.
   function makeRemoteRW(initial?: string[], readThrows = false): {
-    rw: SharedConfigReader & SharedConfigWriter;
+    rw: ConfigReader & ConfigWriter;
     store: Record<string, string>;
   } {
     const store: Record<string, string> = {};
     if (initial) store['.obsidian/community-plugins.json'] = JSON.stringify(initial);
-    const rw: SharedConfigReader & SharedConfigWriter = {
+    const rw: ConfigReader & ConfigWriter = {
       exists: (p) => Promise.resolve(p in store),
       read: (p) => (readThrows ? Promise.reject(new Error('SSH hiccup')) : Promise.resolve(store[p])),
       write: (p, c) => { store[p] = c; return Promise.resolve(); },
@@ -1284,7 +1101,7 @@ describe('ShadowVaultBootstrap community-plugins 3-way merge (uninstall propagat
 
   /** In-memory remote. `initial === null` → the remote has no list at all. */
   function makeRemote(initial: string[] | null): {
-    rw: SharedConfigReader & SharedConfigWriter;
+    rw: ConfigReader & ConfigWriter;
     read: () => string[] | null;
   } {
     const store: Record<string, string> = {};
@@ -1301,7 +1118,7 @@ describe('ShadowVaultBootstrap community-plugins 3-way merge (uninstall propagat
 
   /** One full connect round-trip: pull, then push — exactly what main.ts does. */
   async function roundTrip(
-    rw: SharedConfigReader & SharedConfigWriter,
+    rw: ConfigReader & ConfigWriter,
     localConfigDir: string,
     basePath: string,
   ): Promise<void> {
@@ -1416,7 +1233,7 @@ describe('ShadowVaultBootstrap community-plugins 3-way merge (uninstall propagat
     // "everything was uninstalled elsewhere".
     const localDir = makeLocal([SELF, 'dataview', 'templater']);
     const basePath = basePathFor([SELF, 'dataview', 'templater']);
-    const rw: SharedConfigReader & SharedConfigWriter = {
+    const rw: ConfigReader & ConfigWriter = {
       exists: () => Promise.resolve(true),
       read: () => Promise.reject(new Error('SSH hiccup')),
       write: () => Promise.reject(new Error('must not push a list built from an unread remote')),
@@ -1517,11 +1334,11 @@ describe('ShadowVaultBootstrap plugin-binary round-trip (#429b — BRAT / non-ma
 
   // Reader+writer fake over an in-memory store keyed by remote rel path.
   function makeRW(seed: Record<string, string> = {}): {
-    rw: SharedConfigReader & SharedConfigWriter;
+    rw: ConfigReader & ConfigWriter;
     store: Record<string, string>;
   } {
     const store: Record<string, string> = { ...seed };
-    const rw: SharedConfigReader & SharedConfigWriter = {
+    const rw: ConfigReader & ConfigWriter = {
       exists: (p) => Promise.resolve(p in store),
       read: (p) => Promise.resolve(store[p]),
       write: (p, c) => { store[p] = c; return Promise.resolve(); },

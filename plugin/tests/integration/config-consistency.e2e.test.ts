@@ -1,8 +1,9 @@
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { ShadowVaultBootstrap } from '../../src/shadow/ShadowVaultBootstrap';
+import { DeviceSettingsSync, stageDeviceSettings } from '../../src/shadow/DeviceSettingsSync';
 import { ObsidianRegistry } from '../../src/shadow/ObsidianRegistry';
 import { setupClientPair, TEST_PRIVATE_KEY, type TestClient } from './helpers/makeAdapter';
 import type { SshProfile } from '../../src/types';
@@ -127,28 +128,33 @@ describe('Config consistency across connect cycles (#429 / #342)', () => {
       .toEqual(expect.arrayContaining(['dataview', 'obsidian-git', 'templater', 'remote-ssh']));
   });
 
-  it('a settings change stays consistent across a write → push → fresh-pull cycle (#342 reproducer)', async () => {
+  it('backs up exact settings for one Client ID and stages them into a fresh shadow (#342)', async () => {
     // Session 1: seed remote app.json, pull into the shadow.
     await remoteClient.adapter.write(APP, JSON.stringify({ useMarkdownLinks: false, theme: 'obsidian' }));
     const p1 = profileFor('app-1');
     const s1 = await freshSession().bootstrap(p1, [p1]);
-    await ShadowVaultBootstrap.pullSharedObsidianConfig(remoteClient.adapter, REMOTE_CFG, s1.layout.configDir);
+    const sync = new DeviceSettingsSync({
+      remote: remoteClient.adapter, remoteConfigDir: REMOTE_CFG, localConfigDir: s1.layout.configDir,
+    });
+    const otherDevice = '{ "useMarkdownLinks": false, "theme": "other-device" }\n';
+    await pair.b.adapter.write(APP, otherDevice);
+    try {
+      await sync.pull();
+      sync.startWatching();
+      const changed = '{ "useMarkdownLinks": true, "theme": "things" }\n';
+      fs.writeFileSync(path.join(s1.layout.configDir, 'app.json'), changed);
+      await vi.waitFor(async () => {
+        expect(await remoteClient.ssh.readText(remoteClient.adapter.toRemote(APP))).toBe(changed);
+      }, { timeout: 6000, interval: 200 });
 
-    // User changes a setting in the shadow, then it's pushed back.
-    const changed = { useMarkdownLinks: true, theme: 'things' };
-    fs.writeFileSync(path.join(s1.layout.configDir, 'app.json'), JSON.stringify(changed));
-    await ShadowVaultBootstrap.pushSharedObsidianConfig(remoteClient.adapter, REMOTE_CFG, s1.layout.configDir);
-
-    // The test holds a snapshot of the intended state.
-    const snapshot = JSON.parse(fs.readFileSync(path.join(s1.layout.configDir, 'app.json'), 'utf-8'));
-
-    // Session 2: a fresh shadow pulls — must equal the snapshot.
-    const p2 = profileFor('app-2');
-    const s2 = await freshSession().bootstrap(p2, [p2]);
-    await ShadowVaultBootstrap.pullSharedObsidianConfig(remoteClient.adapter, REMOTE_CFG, s2.layout.configDir);
-
-    const local2 = JSON.parse(fs.readFileSync(path.join(s2.layout.configDir, 'app.json'), 'utf-8'));
-    expect(local2, 'the setting changed in session 1 must be consistent in session 2').toEqual(snapshot);
+      const p2 = profileFor('app-2');
+      const s2 = await freshSession().bootstrap(p2, [p2]);
+      await stageDeviceSettings({ remoteConfigDir: REMOTE_CFG, localConfigDir: s2.layout.configDir }, remoteClient.adapter);
+      expect(fs.readFileSync(path.join(s2.layout.configDir, 'app.json'), 'utf-8')).toBe(changed);
+      expect(await pair.b.ssh.readText(pair.b.adapter.toRemote(APP))).toBe(otherDevice);
+    } finally {
+      sync.stop();
+    }
   });
 
   it('a sideloaded plugin binary enabled on another machine is staged into a fresh shadow (#429b)', async () => {

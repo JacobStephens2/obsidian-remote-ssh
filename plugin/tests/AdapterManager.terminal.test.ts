@@ -21,6 +21,7 @@ function harness() {
   const stop = vi.fn();
   const pause = vi.fn();
   const resume = vi.fn();
+  const settingsLifetime = { stop: vi.fn(), pause: vi.fn(), resume: vi.fn() };
   const list = vi.fn();
   const setReconnecting = vi.fn();
   const replayOfflineQueue = vi.fn();
@@ -29,7 +30,7 @@ function harness() {
   // physical ownership is covered by AdapterManager.test.ts.
   const p = plugin as unknown as {
     settings: unknown; conn: unknown; adapterMgr: unknown; statusBar: unknown;
-    population: unknown;
+    population: unknown; deviceSettings: unknown;
     state: SyncState; setState: (s: SyncState) => void;
     cancelReconnect(): void; startReconnect(): Promise<void>;
     onReconnectStateChange(s: unknown): void; debugRestoreAdapter(): void;
@@ -46,15 +47,16 @@ function harness() {
   p.conn = conn;
   const adapterMgr = {
     restore, isPatched: () => true, replayOfflineQueue,
-    dataAdapter: { setReconnecting, list } as Partial<SftpDataAdapter> | null,
+    dataAdapter: { setReconnecting, list, isReconnecting: () => false } as Partial<SftpDataAdapter> | null,
   };
   p.adapterMgr = adapterMgr;
   p.statusBar = { remove: vi.fn(), update: vi.fn() };
   p.population = { stop, pause, resume };
+  p.deviceSettings = settingsLifetime;
   p.state = SyncState.IDLE;
   p.setState = vi.fn((state) => { p.state = state; });
   plugin.app.workspace.detachLeavesOfType = vi.fn();
-  return { plugin, p, settings, conn, adapterMgr, restore, stop, pause, resume, startReconnect, list, setReconnecting, replayOfflineQueue };
+  return { plugin, p, settings, conn, adapterMgr, restore, stop, pause, resume, startReconnect, list, setReconnecting, replayOfflineQueue, settingsLifetime };
 }
 
 afterEach(() => { vi.restoreAllMocks(); clearNotices(); });
@@ -63,30 +65,36 @@ describe('plugin terminal adapter lifetimes', () => {
   it('restores when reconnect is cancelled', () => {
     const h = harness(); h.p.cancelReconnect(); expect(h.restore).toHaveBeenCalledOnce();
     expect(h.stop).toHaveBeenCalledBefore(h.restore);
+    expect(h.settingsLifetime.stop).toHaveBeenCalledBefore(h.restore);
   });
   it('restores when retries are disabled', async () => {
     const h = harness(); await h.p.startReconnect(); expect(h.restore).toHaveBeenCalledOnce();
     expect(h.stop).toHaveBeenCalledBefore(h.restore);
+    expect(h.settingsLifetime.stop).toHaveBeenCalledBefore(h.restore);
     expect(h.startReconnect).not.toHaveBeenCalled();
   });
   it('restores when reconnect fails', () => {
     const h = harness(); h.p.onReconnectStateChange({ kind: 'failed', reason: 'connection lost' });
     expect(h.restore).toHaveBeenCalledOnce();
     expect(h.stop).toHaveBeenCalledBefore(h.restore);
+    expect(h.settingsLifetime.stop).toHaveBeenCalledBefore(h.restore);
   });
   it('restores on disconnect', async () => {
     const h = harness(); await h.plugin.disconnect(); expect(h.restore).toHaveBeenCalledOnce();
     expect(h.stop).toHaveBeenCalledBefore(h.restore);
+    expect(h.settingsLifetime.stop).toHaveBeenCalledBefore(h.restore);
     expect(h.restore).toHaveBeenCalledBefore(h.conn.disconnectTransport);
   });
   it('restores synchronously on unload', async () => {
     const h = harness(); h.plugin.onunload(); expect(h.restore).toHaveBeenCalled();
     expect(h.stop).toHaveBeenCalledBefore(h.restore);
+    expect(h.settingsLifetime.stop).toHaveBeenCalledBefore(h.restore);
     await Promise.resolve(); await Promise.resolve();
   });
   it('restores through the manual command', () => {
     const h = harness(); h.p.debugRestoreAdapter();
     expect(h.stop).toHaveBeenCalledBefore(h.restore);
+    expect(h.settingsLifetime.stop).toHaveBeenCalledBefore(h.restore);
     expect(h.restore).toHaveBeenCalledOnce();
   });
 
@@ -95,9 +103,10 @@ describe('plugin terminal adapter lifetimes', () => {
     h.p.population = null;
     let prepared!: () => void;
     const pending = new Promise<void>(resolve => { prepared = resolve; });
-    vi.spyOn(ShadowStartupCoordinator.prototype, 'prepareForAutoConnect').mockReturnValue(pending);
+    const prepare = vi.spyOn(ShadowStartupCoordinator.prototype, 'prepareForAutoConnect').mockReturnValue(pending);
     const connect = vi.spyOn(h.plugin, 'connectProfile').mockResolvedValue(undefined);
     const startup = h.p.runShadowStartup();
+    expect(h.settingsLifetime.stop).toHaveBeenCalledBefore(prepare);
     await h.plugin.disconnect();
     prepared();
     await startup;
@@ -112,17 +121,19 @@ describe('plugin terminal adapter lifetimes', () => {
       h.p.setState(SyncState.CONNECTED);
       return Promise.resolve();
     });
-    type ConfigResult = Awaited<ReturnType<typeof ShadowVaultBootstrap.pullSharedObsidianConfig>>;
-    let pulled!: (result: ConfigResult) => void;
-    const pending = new Promise<ConfigResult>(resolve => { pulled = resolve; });
-    const pull = vi.spyOn(ShadowVaultBootstrap, 'pullSharedObsidianConfig').mockReturnValue(pending);
+    const { promise, reject } = Promise.withResolvers<string | null>();
+    const readDeviceSetting = vi.fn((_file: string, _signal: AbortSignal) => promise);
+    Object.assign(h.adapterMgr.dataAdapter!, { readDeviceSetting });
     const community = vi.spyOn(ShadowVaultBootstrap, 'pullCommunityPlugins');
 
     const startup = h.p.runAutoConnect('reconnect');
-    await vi.waitFor(() => expect(pull).toHaveBeenCalledOnce());
+    await vi.waitFor(() => expect(readDeviceSetting).toHaveBeenCalledOnce());
     h.p.debugRestoreAdapter();
-    pulled({ pulled: [], skipped: [], errored: ['app.json'] });
+    expect(readDeviceSetting.mock.calls[0][1].aborted).toBe(true);
     await startup;
+    reject(new Error('transport ended'));
+    await Promise.resolve();
+    expect(readDeviceSetting).toHaveBeenCalledOnce();
     expect(community).not.toHaveBeenCalled();
     expect(h.list).not.toHaveBeenCalled();
     expect(recordedNotices()).toEqual(['Remote SSH: adapter restored']);
@@ -148,12 +159,15 @@ describe('plugin terminal adapter lifetimes', () => {
     expect(recordedNotices()).toEqual(['Remote SSH: adapter restored']);
   });
 
-  it('pauses before starting retries and resumes after the same adapter is unblocked', async () => {
+  it('resumes population on the same adapter while settings wait for offline replay', async () => {
     const h = harness();
     h.settings.reconnectMaxRetries = 3;
     const rpc = { rpc: { call: vi.fn() }, info: { capabilities: ['fs.walk'] } };
+    const replay = Promise.withResolvers<void>();
+    h.replayOfflineQueue.mockReturnValue(replay.promise);
     await h.p.startReconnect();
     expect(h.pause).toHaveBeenCalledBefore(h.startReconnect);
+    expect(h.settingsLifetime.pause).toHaveBeenCalledBefore(h.startReconnect);
     const [{ onState, setAdapterReconnecting }] = h.startReconnect.mock.calls[0];
     setAdapterReconnecting(true);
     Object.assign(h.conn, { rpcConnection: rpc });
@@ -162,6 +176,24 @@ describe('plugin terminal adapter lifetimes', () => {
     expect(h.setReconnecting).toHaveBeenCalledBefore(h.resume);
     expect(h.resume).toHaveBeenCalledWith({ adapter: { list: expect.any(Function) }, rpcConnection: rpc, ignoreDirs: [] });
     expect(h.replayOfflineQueue).toHaveBeenCalledWith('after-reconnect');
+    expect(h.settingsLifetime.resume).not.toHaveBeenCalled();
+    replay.resolve();
+    await replay.promise;
+    expect(h.settingsLifetime.resume).toHaveBeenCalledOnce();
+  });
+
+  it('ignores replay completion after another reconnect has started', async () => {
+    const h = harness();
+    h.settings.reconnectMaxRetries = 3;
+    const replay = Promise.withResolvers<void>();
+    h.replayOfflineQueue.mockReturnValue(replay.promise);
+    await h.p.startReconnect();
+    h.startReconnect.mock.calls[0][0].onState({ kind: 'recovered' });
+    await h.p.startReconnect();
+    replay.resolve();
+    await replay.promise;
+    expect(h.settingsLifetime.pause).toHaveBeenCalledTimes(2);
+    expect(h.settingsLifetime.resume).not.toHaveBeenCalled();
   });
 
   it('ignores late reconnect callbacks after cancellation', async () => {
@@ -197,7 +229,7 @@ describe('plugin terminal adapter lifetimes', () => {
   it('rebinds an adapter installed during an automatic retry', async () => {
     const h = harness();
     h.settings.reconnectMaxRetries = 3;
-    const adapter = { setReconnecting: vi.fn(), swapClient: vi.fn(), list: vi.fn() };
+    const adapter = { setReconnecting: vi.fn(), swapClient: vi.fn(), list: vi.fn(), isReconnecting: () => false };
     h.adapterMgr.dataAdapter = null;
     await h.p.startReconnect();
     const [retry] = h.startReconnect.mock.calls[0];

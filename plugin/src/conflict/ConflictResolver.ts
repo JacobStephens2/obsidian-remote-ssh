@@ -63,41 +63,47 @@ export class ConflictResolver {
     mine: Buffer,
     isText: boolean,
     originalError: unknown,
+    checkConnected?: () => void,
   ): Promise<Buffer> {
+    const transport = { client: this.client, checkConnected };
     if (isText && this.ancestorTracker && this.onTextConflict) {
       const ancestor = this.ancestorTracker.get(normalizedPath);
       if (ancestor !== null) {
         let theirsBuf: Buffer;
         try {
-          theirsBuf = await this.client.readBinary(remote);
+          theirsBuf = await transport.client.readBinary(remote);
         } catch (re) {
+          checkConnected?.();
           logger.warn(
             `ConflictResolver: re-read of "${remote}" failed (${errorMessage(re)}); ` +
             'falling back to the two-choice modal',
           );
-          return await this.fallbackTwoChoice(normalizedPath, remote, mine, originalError);
+          return await this.fallbackTwoChoice(normalizedPath, remote, mine, originalError, transport);
         }
+        checkConnected?.();
         const decision = await this.onTextConflict(normalizedPath, {
           ancestor: ancestor.content,
           mine:     mine.toString('utf8'),
           theirs:   theirsBuf.toString('utf8'),
         }).catch(() => ({ decision: 'cancel' as const }));
+        checkConnected?.();
 
         switch (decision.decision) {
           case 'keep-mine':
-            await this.client.writeBinary(remote, mine);
+            await this.overwrite(transport, remote, mine);
             return mine;
           case 'merged': {
             const merged = Buffer.from(decision.content, 'utf8');
-            await this.client.writeBinary(remote, merged);
+            await this.overwrite(transport, remote, merged);
             return merged;
           }
           case 'keep-theirs': {
             let mtime = 0;
             try {
-              const s = await this.client.stat(remote);
+              const s = await transport.client.stat(remote);
               mtime = s.mtime;
             } catch { /* best effort */ }
+            checkConnected?.();
             this.readCache.put(remote, theirsBuf, mtime);
             if (this.ancestorTracker) {
               this.ancestorTracker.remember(normalizedPath, theirsBuf.toString('utf8'), mtime);
@@ -109,7 +115,7 @@ export class ConflictResolver {
         }
       }
     }
-    return await this.fallbackTwoChoice(normalizedPath, remote, mine, originalError);
+    return await this.fallbackTwoChoice(normalizedPath, remote, mine, originalError, transport);
   }
 
   /**
@@ -122,11 +128,23 @@ export class ConflictResolver {
     remote: string,
     mine: Buffer,
     originalError: unknown,
+    transport: { client: RemoteFsClient; checkConnected?: () => void },
   ): Promise<Buffer> {
     if (!this.onWriteConflict) throw originalError;
     const overwrite = await this.onWriteConflict(normalizedPath).catch(() => false);
+    transport.checkConnected?.();
     if (!overwrite) throw originalError;
-    await this.client.writeBinary(remote, mine);
+    await this.overwrite(transport, remote, mine);
     return mine;
+  }
+
+  private overwrite(
+    { client, checkConnected }: { client: RemoteFsClient; checkConnected?: () => void },
+    remote: string,
+    data: Buffer,
+  ): Promise<void> {
+    return checkConnected
+      ? client.writeBinary(remote, data, undefined, checkConnected)
+      : client.writeBinary(remote, data);
   }
 }

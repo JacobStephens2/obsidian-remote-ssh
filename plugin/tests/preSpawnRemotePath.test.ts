@@ -39,4 +39,10 @@ describe('preSpawnRemotePath', () => {
     expect(preSpawnRemotePath(a, base, '.obsidian/app.json'))
       .not.toBe(preSpawnRemotePath(b, base, '.obsidian/app.json'));
   });
+
+  it('maps settings under the active custom config directory', () => {
+    const custom = new PathMapper('host-a', '.obsidian-work');
+    expect(preSpawnRemotePath(custom, base, '.obsidian-work/app.json'))
+      .toBe(`${base}/.obsidian-work/user/host-a/app.json`);
+  });
 });
