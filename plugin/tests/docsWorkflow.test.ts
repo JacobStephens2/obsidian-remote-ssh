@@ -284,23 +284,22 @@ function loadWorkflow(): Workflow {
 function resolveChannel(
   script: string,
   input: { event: string; ref: string; base: string },
-): { channel: string; url: string; canaryExists: boolean } {
+): { channel: string; url: string } {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'docs-channel-'));
-  const scriptPath = path.join(dir, 'resolve.sh');
   const envPath = path.join(dir, 'github.env');
-  const canary = path.join(dir, 'canary');
-  fs.writeFileSync(scriptPath, script);
+  fs.writeFileSync(path.join(dir, 'resolve.sh'), script);
   fs.writeFileSync(envPath, '');
   try {
-    execFileSync('bash', ['--noprofile', '--norc', '-eo', 'pipefail', scriptPath], {
+    // Inherit PATH (and PATHEXT on Windows). A hard-coded Unix PATH
+    // makes `bash` resolve on Linux and miss Git Bash on windows-latest.
+    execFileSync('bash', ['--noprofile', '--norc', '-eo', 'pipefail', 'resolve.sh'], {
+      cwd: dir,
       env: {
-        PATH: '/usr/bin:/bin',
-        HOME: os.homedir(),
+        ...process.env,
         GITHUB_ENV: envPath,
         EVENT_NAME: input.event,
         REF_NAME: input.ref,
         BASE_REF: input.base,
-        CANARY: canary,
       },
     });
     const values = Object.fromEntries(
@@ -316,7 +315,6 @@ function resolveChannel(
     return {
       channel: values.DOCS_CHANNEL ?? '',
       url: values.QUARTZ_BASE_URL ?? '',
-      canaryExists: fs.existsSync(canary),
     };
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
@@ -422,14 +420,12 @@ describe('Resolve docs channel', () => {
     expect(resolveChannel(script, { event: 'push', ref: 'main', base: '' })).toEqual({
       channel: 'stable',
       url: STABLE_URL,
-      canaryExists: false,
     });
     expect(
       resolveChannel(script, { event: 'pull_request', ref: '12/merge', base: 'main' }),
     ).toEqual({
       channel: 'stable',
       url: STABLE_URL,
-      canaryExists: false,
     });
   });
 
@@ -446,7 +442,6 @@ describe('Resolve docs channel', () => {
       expect(resolveChannel(script, input), JSON.stringify(input)).toEqual({
         channel: 'dev',
         url: DEV_URL,
-        canaryExists: false,
       });
     }
   });
