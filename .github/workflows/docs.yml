@@ -11,17 +11,20 @@ on:
       - "docs/**"
       - ".github/workflows/docs.yml"
 
-# gh-pages deploy requires write access to contents
+# Read by default. contents: write is granted only on the deploy job,
+# which is the only job that pushes gh-pages.
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: docs-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  build-deploy:
+  build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v7
         with:
@@ -57,15 +60,21 @@ jobs:
 
       # ── Resolve channel + base URL ───────────────────────────────────────
       # One build path for every trigger. The base URL is the only
-      # thing that differs between channels, so compute it once:
-      #   - stable  : push main      OR PR whose base is main
-      #   - dev     : push next      OR PR whose base is next (or any
-      #               other PR — build-only, never deployed, so the
-      #               exact URL doesn't matter, just that it builds)
+      # thing that differs between channels:
+      #   - stable: push of main, or a pull_request whose base is main
+      #   - dev: every other run
+      # The branch name is data. Compare the quoted environment
+      # variables so it cannot break out of the script text.
+      # Custom names on purpose: Actions ignores env assignments that
+      # reuse the default GITHUB_* variables.
       - name: Resolve docs channel
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          BASE_REF: ${{ github.base_ref }}
         run: |
-          if [[ "${{ github.event_name }}" == "push" && "${{ github.ref_name }}" == "main" ]] \
-             || [[ "${{ github.event_name }}" == "pull_request" && "${{ github.base_ref }}" == "main" ]]; then
+          if [[ "$EVENT_NAME" == "push" && "$REF_NAME" == "main" ]] \
+             || [[ "$EVENT_NAME" == "pull_request" && "$BASE_REF" == "main" ]]; then
             echo "QUARTZ_BASE_URL=codes.sota-shimozono.com/obsidian-remote-ssh"     >> "$GITHUB_ENV"
             echo "DOCS_CHANNEL=stable" >> "$GITHUB_ENV"
           else
@@ -73,16 +82,43 @@ jobs:
             echo "DOCS_CHANNEL=dev" >> "$GITHUB_ENV"
           fi
 
-      # ── Build (ALWAYS — incl. PRs, so a docs break is caught pre-merge
+      # ── Build (ALWAYS, including PRs, so a docs break is caught pre-merge
       #    instead of turning main/next red post-merge) ──────────────────
       - name: Build docs (${{ env.DOCS_CHANNEL }})
-        # Invoke via node directly — bypasses bin-shim/exec-bit issues
+        # Invoke via node directly. That bypasses bin-shim/exec-bit issues
         # (npx fell back to a non-executable shim on the main-branch run).
         # QUARTZ_BASE_URL comes from the resolve step via $GITHUB_ENV.
         run: node ./quartz/bootstrap-cli.mjs build -d docs
 
-      # ── Deploy (push to a release branch only — never on PRs) ────────────
-      - name: Deploy — stable → gh-pages root
+      # Dotfiles such as Quartz's .nojekyll have to travel with the
+      # site. upload-artifact drops them unless asked.
+      - name: Upload built site
+        uses: actions/upload-artifact@v7
+        with:
+          name: docs-site
+          path: public
+          if-no-files-found: error
+          include-hidden-files: true
+
+  deploy:
+    needs: build
+    # Push of main or next only. Pull requests build, then stop.
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/next')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      # JamesIves publishes from a worktree of this checkout.
+      - uses: actions/checkout@v7
+
+      - name: Download built site
+        uses: actions/download-artifact@v8
+        with:
+          name: docs-site
+          path: public
+
+      # ── Deploy (push to a release branch only, never on PRs) ─────────────
+      - name: Deploy - stable to gh-pages root
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: JamesIves/github-pages-deploy-action@v4
         with:
@@ -93,7 +129,7 @@ jobs:
           clean-exclude: |
             dev/
 
-      - name: Deploy — dev → gh-pages /dev/
+      - name: Deploy - dev to gh-pages /dev/
         if: github.event_name == 'push' && github.ref == 'refs/heads/next'
         uses: JamesIves/github-pages-deploy-action@v4
         with:
